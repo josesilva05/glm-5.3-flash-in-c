@@ -327,6 +327,20 @@ top-1 stayed the same, but the logits moved (RMS 0.77, correlation 0.92 against 
 path). The quantiser is vectorised because it sits in the read path: the first, scalar
 version made decode 3.27 s/token, slower than not quantising at all.
 
+### Cache size, measured (40 tokens, `--gpu`, one idle machine)
+
+| experts | cache | slots | reads per token | decode s/token | peak RSS |
+|---|---|---|---|---|---|
+| FP8 | 38 GB | 1,508 | 3.66 GB | 1.70 | 40.0 GB |
+| FP8 | 46 GB | 1,826 | 3.64 GB | 1.74 | 48.0 GB |
+| FP8 | 52 GB | 2,064 | 3.45 GB | 1.65 | 54.0 GB |
+| int4 | 52 GB | 3,673 | 2.19 GB | 1.38 | 54.1 GB |
+
+More cache buys less and less: 14 GB more RAM moved the exact path by 3%, because a token
+draws 336 experts out of 12,096 (305 GB) and a cache of this size covers about a sixth of
+them. On 64 GB, 38 GB of cache is the comfortable setting and 52 GB leaves too little for
+the rest of the system; the int4 mode is the one that turns extra RAM into speed.
+
 ### What did not work on the exact path
 
 Three attempts to read fewer FP8 bytes without touching a single weight, all measured and
