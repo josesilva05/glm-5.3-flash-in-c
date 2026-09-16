@@ -26,6 +26,8 @@ size_t glm53f_model_state_bytes(const Glm53fModel *m)
     return glm53f_kda_state_floats(&m->cfg) * (size_t)m->n_bound * sizeof(float);
 }
 
+static int forward_cpu(Glm53fModel *m, const int *ids, int T, float *logits, int *argmax_all);
+
 static int n_mla_layers(const Glm53fCfg *c)
 {
     int n = 0;
@@ -121,10 +123,21 @@ int glm53f_model_open(Glm53fModel *m, const char *dir, const char *cfg_path, dou
     uint64_t avail = glm53f_avail_ram_bytes();
     /* --gpu frees the trunk right after the upload, so that RAM counts as free here. */
     if (avail > 0 && gpu_planned) avail += (uint64_t)m->trunk_bytes + (uint64_t)m->mb.nbytes / 2;
-    const int64_t headroom = (int64_t)3e9;
+    /* What this session will take besides the expert cache: the attention caches, the
+     * indexer state and the buffers one chunk of a forward pass needs. */
+    const int mla = n_mla_layers(c);
+    const int kv_compressed = kv == 2 || (kv == 0 && cap > glm53f_dense_attn_limit(c));
+    const int64_t kvb_est = (int64_t)mla * cap *
+                            (kv_compressed ? c->kv_lora : (int)glm53f_kv_floats_per_pos(c)) * 4;
+    const int64_t idxb_est = (int64_t)mla * (int64_t)glm53f_dsa_state_floats(c, cap) * 4;
+    const int64_t work_est = (int64_t)(glm53f_layer_scratch(c, GLM53F_CPU_CHUNK, cap) +
+                                       (size_t)GLM53F_CPU_CHUNK * c->hc_mult * c->hidden +
+                                       (size_t)c->vocab) * 4;
+    const int64_t state_est = (int64_t)(glm53f_kda_state_floats(c) * (size_t)c->n_layers) * 4;
+    const int64_t headroom = (int64_t)3e9 + kvb_est + idxb_est + work_est + state_est;
     if (avail > 0 && budget > (int64_t)avail - headroom) {
         const int64_t fit = (int64_t)avail - headroom;
-        const int64_t least = (int64_t)(c->topk + 1) * 26e6;
+        const int64_t least = (int64_t)(c->topk + 1) * 26000000;
         if (fit < least) {
             fprintf(stderr, "glm53f: only %.1f GB of RAM is free; the expert cache needs at "
                             "least %.1f GB. Close something or use --gpu (which frees the "
@@ -133,9 +146,11 @@ int glm53f_model_open(Glm53fModel *m, const char *dir, const char *cfg_path, dou
             glm53f_model_close(m);
             return -1;
         }
-        printf("NOTE: --cache-gb %.1f would not fit in the %.1f GB of free RAM; using %.1f GB.\n"
-               "      (with --gpu the trunk's %.1f GB is freed after upload, so more fits)\n",
-               cache_gb, (double)avail / 1e9, (double)fit / 1e9, (double)m->trunk_bytes / 1e9);
+        printf("NOTE: --cache-gb %.1f does not fit: %.1f GB of RAM is free and this session also "
+               "needs%.1f GB\n      (attention caches, indexer, work buffers) plus 3 GB of headroom; "
+               "using %.1f GB of cache.\n",
+               cache_gb, (double)avail / 1e9,
+               (double)(kvb_est + idxb_est + work_est + state_est) / 1e9, (double)fit / 1e9);
         budget = fit;
     }
     if (glm53f_cache_init(&m->cache, &m->st, c, budget, n_io, expert_i4) != 0) {
@@ -322,7 +337,6 @@ static int argmax_(const float *v, int n)
 int glm53f_model_forward(Glm53fModel *m, const int *ids, int T, float *logits, int *argmax_all)
 {
     const Glm53fCfg *c = &m->cfg;
-    const int E = c->hidden, M = c->hc_mult;
     if (T < 1) return -1;
     if (m->cached + T > m->cap) {
         fprintf(stderr, "glm53f: %d cached + %d new positions exceed the session capacity %d\n",
@@ -337,6 +351,31 @@ int glm53f_model_forward(Glm53fModel *m, const int *ids, int T, float *logits, i
 #ifdef GLM53F_CUDA
     if (m->gpu) return glm53f_gpu_forward(m->gpu, m, ids, T, logits, argmax_all);
 #endif
+    /* A prompt is fed in chunks: the state each chunk leaves behind (KDA recurrence, KV
+     * cache, indexer) is exactly what the next chunk needs, and the buffers stay small.
+     * GLM53F_CHUNK overrides the size; the output must not depend on it (tested). */
+    static int chunk = 0;
+    if (!chunk) {
+        const char *e = getenv("GLM53F_CHUNK");
+        chunk = e ? atoi(e) : GLM53F_CPU_CHUNK;
+        if (chunk < 1) chunk = GLM53F_CPU_CHUNK;
+    }
+    for (int t0 = 0; t0 < T; t0 += chunk) {
+        const int n = T - t0 < chunk ? T - t0 : chunk;
+        const int last = t0 + n == T;
+        if (forward_cpu(m, ids + t0, n, last ? logits : NULL,
+                        argmax_all ? argmax_all + t0 : NULL) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+/* One chunk of at most GLM53F_CPU_CHUNK positions on the CPU. Every buffer here is sized
+ * by the chunk, so a long prompt costs the same working memory as a short one. */
+static int forward_cpu(Glm53fModel *m, const int *ids, int T, float *logits, int *argmax_all)
+{
+    const Glm53fCfg *c = &m->cfg;
+    const int E = c->hidden, M = c->hc_mult;
 
     const size_t hsz = (size_t)T * M * E;
     float *h  = (float *)malloc(hsz * sizeof(float));

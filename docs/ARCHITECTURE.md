@@ -150,7 +150,11 @@ formats, so the dtype cannot live on the layer struct. `glm53f_mm` dispatches:
    mHC expand; mHC site -> RMSNorm -> dense MLP or MoE -> mHC expand;
 3. mean of streams -> final RMSNorm -> `lm_head`.
 
-Prefill is one call with the whole prompt; each decode step is one call with one token.
+A prompt is fed in chunks of 256 positions (`GLM53F_CPU_CHUNK`): what a chunk leaves behind
+(KDA recurrence, KV cache, indexer state) is exactly what the next one needs, so the working
+buffers stay the size of one chunk instead of growing with the prompt. `GLM53F_CHUNK`
+overrides the size, and `tiny_oracle_chunked` runs the whole oracle with chunks of 7 to show
+the results do not depend on it. Each decode step is one call with one token.
 
 ### 2.4 MoE and expert streaming
 

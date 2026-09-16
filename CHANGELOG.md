@@ -26,6 +26,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The expert cache is capped by the free physical memory at open time (3 GB of headroom,
   the trunk's RAM counted as free when `--gpu` is requested): asking for more than fits
   used to page the machine to a standstill instead of failing.
+- Prefills are fed in chunks of 256 positions, so the working buffers no longer grow with
+  the prompt (a 7,598-position session now peaks at the same buffers as a short one), and
+  the memory guard accounts for the attention caches, the indexer state and those buffers
+  instead of only the expert cache.
 - `--kv compressed`: the MLA cache can hold the `kv_lora` latent per position (22 KB)
   instead of the expanded keys and values (1.44 MB), by folding `kv_b` into the query and
   the output. 64x less memory, the same value to 7.6e-06, chosen automatically past 2051

@@ -341,6 +341,9 @@ static inline size_t glm53f_kv_floats_per_pos(const Glm53fCfg *c)
 /* Positions one session may hold. Beyond index_topk + index_kpool - 1 the DSA indexer
  * selects (glm53f_dsa.c); the ceiling here is the KV cache, which grows linearly. */
 #define GLM53F_MAX_POSITIONS 32768
+/* Positions one forward pass works on at a time: the prompt is fed in chunks of this many,
+ * so the working buffers do not grow with its length. */
+#define GLM53F_CPU_CHUNK 256
 #define GLM53F_MAX_PROMPT 32768
 #define GLM53F_MAX_GEN     8192
 
