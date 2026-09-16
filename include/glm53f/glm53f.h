@@ -239,6 +239,10 @@ typedef struct {
      * (GLM53F_PREDICT_STATS) only. */
     const float *ahead_gate[3], *ahead_bias[3];
     int          prefetch_n;          /* predicted experts to hint per decode step, 0 = off */
+    /* A prefill hints the next layer's predicted experts only when the cache holds two
+     * layers' experts: a prefill goes layer by layer, so with room for one layer those reads
+     * evict experts the current layer's later chunks still need. */
+    int          prefill_next;
     int          layer;
 } Glm53fMoeW;
 
@@ -354,6 +358,11 @@ static inline size_t glm53f_kv_floats_per_pos(const Glm53fCfg *c)
 /* Positions one forward pass works on at a time: the prompt is fed in chunks of this many,
  * so the working buffers do not grow with its length. */
 #define GLM53F_CPU_CHUNK 256
+/* Positions whose residual streams a prefill holds at once (65 KB each). Within that span
+ * the prompt goes layer by layer, every chunk through one layer before the next layer
+ * starts, so a layer's routed experts are read once for the span instead of once per
+ * chunk. The arithmetic of each chunk is unchanged. */
+#define GLM53F_PREFILL_SPAN 4096
 #define GLM53F_MAX_PROMPT 32768
 #define GLM53F_MAX_GEN     8192
 

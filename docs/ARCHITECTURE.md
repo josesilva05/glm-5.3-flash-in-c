@@ -67,8 +67,8 @@ out = o_proj( softmax(q.k / sqrt(256)) causal . v )
 The checkpoint also carries a DeepSeek Sparse Attention (DSA) indexer. It selects
 `index_topk / index_kpool = 512` pools of 4 tokens plus the incomplete tail, so for a
 sequence of at most `index_topk + index_kpool - 1 = 2051` positions it selects every
-visible token and the sparse attention equals dense causal attention exactly. The engine
-computes dense attention and refuses longer sessions.
+visible token and the sparse attention equals dense causal attention exactly. Up to there
+the engine computes dense attention; past it the indexer selects (2.6).
 
 ### 1.4 Feed-forward
 
@@ -104,6 +104,7 @@ src/tokenizer/glm53f_tok.h    tokenizer from tiktoken.model + tokenizer_config.j
 src/gpu/glm53f_gpu.c/.h       CUDA backend, host side: placement, fp32 copies, keep-warm, forward (optional)
 src/gpu/glm53f_gpu_kernels.*  CUDA kernels mirroring glm53f_ops.c
 src/cli/glm53f_run.c          command line: chat template, greedy decode, EOS, reports
+src/cli/glm53f_chat.c/.h      interactive session (--chat): turns, commands, /save
 third_party/                  json.h, tok.h (BPE), Unicode tables
 ```
 
@@ -152,9 +153,26 @@ formats, so the dtype cannot live on the layer struct. `glm53f_mm` dispatches:
 
 A prompt is fed in chunks of 256 positions (`GLM53F_CPU_CHUNK`): what a chunk leaves behind
 (KDA recurrence, KV cache, indexer state) is exactly what the next one needs, so the working
-buffers stay the size of one chunk instead of growing with the prompt. `GLM53F_CHUNK`
-overrides the size, and `tiny_oracle_chunked` runs the whole oracle with chunks of 7 to show
-the results do not depend on it. Each decode step is one call with one token.
+buffers stay the size of one chunk instead of growing with the prompt.
+
+The chunks go **layer by layer**: every chunk passes layer L before any chunk enters layer
+L+1. Nothing a chunk computes at layer L depends on layer L+1, so the order changes no sum,
+but it decides how often routed experts are read. Chunk by chunk through all 45 layers, each
+chunk routed to nearly all 288 experts of every layer and evicted the previous chunk's, and a
+372-token prompt read 431 GB, more than the 305 GB of experts the model has. Layer by layer,
+a layer's experts are read once for the whole prompt (PERFORMANCE.md, Prefill). The residual
+streams of up to `GLM53F_PREFILL_SPAN` = 4096 positions (65 KB each) wait between layers;
+longer prompts go span by span. With `--gpu` the streams wait in host memory and each chunk
+visits the layer's device.
+
+For the same reason a prefill hints the next layer's predicted experts (2.5) only when the
+cache holds two layers' worth of experts: with room for one, those reads would evict experts
+the current layer's later chunks still need.
+
+`GLM53F_CHUNK` and `GLM53F_SPAN` override both sizes; `tiny_oracle_chunked` (chunks of 7)
+and `tiny_oracle_spans` (chunks of 7 in spans of 17, layers split across two GPUs in a CUDA
+build) run the whole oracle to show the results do not depend on them. Each decode step is
+one call with one token.
 
 ### 2.4 MoE and expert streaming
 

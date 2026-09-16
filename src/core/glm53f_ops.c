@@ -1162,7 +1162,7 @@ static void moe_chunk(float *out, const float *x, const Glm53fMoeW *w, const Glm
             if (T == 1) {
                 route_topn(pred, per, x, w->next_gate, w->next_bias, c);
                 w->src->hint(w->src, w->layer + 1, pred, per);
-            } else if (per > 0) {
+            } else if (per > 0 && (w->prefill_next || prefill_pred >= 0)) {
                 int votes[1024], order[1024], no = 0, tmp[2 * GLM53F_MAX_TOPK];
                 memset(votes, 0, (size_t)NE * sizeof(int));
                 for (int t = 0; t < T; t++) {

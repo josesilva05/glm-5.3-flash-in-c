@@ -123,6 +123,13 @@ int glm53f_model_open(Glm53fModel *m, const char *dir, const char *cfg_path, dou
      * resident at this point). Paging an expert cache is far worse than a smaller one. */
     int64_t budget = (int64_t)(cache_gb * 1e9);
     uint64_t avail = glm53f_avail_ram_bytes();
+    /* cache_gb <= 0 asks for the cache to be sized from the free memory. The system keeps a
+     * fifth of the installed RAM on top of the usual headroom, for whatever is opened while
+     * the session runs: a cache that fits only the moment the model opens is how a machine
+     * ends up paging. */
+    const int auto_size = cache_gb <= 0.0;
+    const uint64_t total_ram = glm53f_total_ram_bytes();
+    if (auto_size) budget = avail > 0 ? INT64_MAX : (int64_t)16e9;
     /* --gpu frees the trunk right after the upload, so that RAM counts as free here. */
     if (avail > 0 && gpu_planned) avail += (uint64_t)m->trunk_bytes + (uint64_t)m->mb.nbytes / 2;
     /* What this session will take besides the expert cache: the attention caches, the
@@ -132,11 +139,17 @@ int glm53f_model_open(Glm53fModel *m, const char *dir, const char *cfg_path, dou
     const int64_t kvb_est = (int64_t)mla * cap *
                             (kv_compressed ? c->kv_lora : (int)glm53f_kv_floats_per_pos(c)) * 4;
     const int64_t idxb_est = (int64_t)mla * (int64_t)glm53f_dsa_state_floats(c, cap) * 4;
+    const int span_est = cap < GLM53F_PREFILL_SPAN ? cap : GLM53F_PREFILL_SPAN;
     const int64_t work_est = (int64_t)(glm53f_layer_scratch(c, GLM53F_CPU_CHUNK, cap) +
-                                       (size_t)GLM53F_CPU_CHUNK * c->hc_mult * c->hidden +
+                                       (size_t)span_est * c->hc_mult * c->hidden +
                                        (size_t)c->vocab) * 4;
     const int64_t state_est = (int64_t)(glm53f_kda_state_floats(c) * (size_t)c->n_layers) * 4;
-    const int64_t headroom = (int64_t)3e9 + kvb_est + idxb_est + work_est + state_est;
+    int64_t reserve = (int64_t)3e9;
+    if (auto_size && total_ram > 0 && (int64_t)(total_ram / 5) > reserve) reserve = (int64_t)(total_ram / 5);
+    const int64_t headroom = reserve + kvb_est + idxb_est + work_est + state_est;
+    /* never more than every routed expert of the model */
+    const int64_t all_experts = (int64_t)c->n_layers * c->n_experts * 26000000;
+    if (budget > all_experts) budget = all_experts;
     if (avail > 0 && budget > (int64_t)avail - headroom) {
         const int64_t fit = (int64_t)avail - headroom;
         const int64_t least = (int64_t)(c->topk + 1) * 26000000;
@@ -148,7 +161,12 @@ int glm53f_model_open(Glm53fModel *m, const char *dir, const char *cfg_path, dou
             glm53f_model_close(m);
             return -1;
         }
-        if (!glm53f_quiet)
+        if (!glm53f_quiet && auto_size)
+        printf("expert cache sized from free memory: %.1f GB free, %.1f GB kept for the system "
+               "and %.1f GB for this session; %.1f GB of cache (--cache-gb sets it)\n",
+               (double)avail / 1e9, (double)reserve / 1e9,
+               (double)(kvb_est + idxb_est + work_est + state_est) / 1e9, (double)fit / 1e9);
+        else if (!glm53f_quiet)
         printf("NOTE: --cache-gb %.1f does not fit: %.1f GB of RAM is free and this session also "
                "needs%.1f GB\n      (attention caches, indexer, work buffers) plus 3 GB of headroom; "
                "using %.1f GB of cache.\n",
@@ -163,6 +181,7 @@ int glm53f_model_open(Glm53fModel *m, const char *dir, const char *cfg_path, dou
         if (!m->lay[L].w.is_dense) {
             m->lay[L].w.moe.src = &m->cache.src;
             m->lay[L].w.moe.prefetch_n = prefetch_n;
+            m->lay[L].w.moe.prefill_next = m->cache.nslot >= 2 * c->n_experts;
         }
     wire_routers(m);
 
@@ -357,17 +376,18 @@ int glm53f_model_forward(Glm53fModel *m, const int *ids, int T, float *logits, i
 #ifdef GLM53F_CUDA
     if (m->gpu) return glm53f_gpu_forward(m->gpu, m, ids, T, logits, argmax_all);
 #endif
-    /* A prompt is fed in chunks: the state each chunk leaves behind (KDA recurrence, KV
-     * cache, indexer) is exactly what the next chunk needs, and the buffers stay small.
-     * GLM53F_CHUNK overrides the size; the output must not depend on it (tested). */
-    static int chunk = 0;
-    if (!chunk) {
-        const char *e = getenv("GLM53F_CHUNK");
-        chunk = e ? atoi(e) : GLM53F_CPU_CHUNK;
-        if (chunk < 1) chunk = GLM53F_CPU_CHUNK;
+    /* A prompt is fed in spans of GLM53F_PREFILL_SPAN positions, each span layer by layer
+     * in chunks (forward_cpu). The state a chunk leaves behind (KDA recurrence, KV cache,
+     * indexer) is exactly what the next chunk needs, so neither size moves the output.
+     * GLM53F_CHUNK and GLM53F_SPAN override them (both tested). */
+    static int span = 0;
+    if (!span) {
+        const char *e = getenv("GLM53F_SPAN");
+        span = e ? atoi(e) : GLM53F_PREFILL_SPAN;
+        if (span < 1) span = GLM53F_PREFILL_SPAN;
     }
-    for (int t0 = 0; t0 < T; t0 += chunk) {
-        const int n = T - t0 < chunk ? T - t0 : chunk;
+    for (int t0 = 0; t0 < T; t0 += span) {
+        const int n = T - t0 < span ? T - t0 : span;
         const int last = t0 + n == T;
         if (forward_cpu(m, ids + t0, n, last ? logits : NULL,
                         argmax_all ? argmax_all + t0 : NULL) != 0)
@@ -376,16 +396,26 @@ int glm53f_model_forward(Glm53fModel *m, const int *ids, int T, float *logits, i
     return 0;
 }
 
-/* One chunk of at most GLM53F_CPU_CHUNK positions on the CPU. Every buffer here is sized
- * by the chunk, so a long prompt costs the same working memory as a short one. */
+/* One span on the CPU: every chunk of at most GLM53F_CPU_CHUNK positions goes through a
+ * layer before the next layer starts. The chunk sizes the working buffers; the span only
+ * sizes the residual streams. Ordering the work by layer is what lets a prefill read each
+ * layer's routed experts once: chunk by chunk through all 45 layers, a 372-token prompt
+ * read 437 GB of experts, more than the 305 GB the model has. */
 static int forward_cpu(Glm53fModel *m, const int *ids, int T, float *logits, int *argmax_all)
 {
     const Glm53fCfg *c = &m->cfg;
     const int E = c->hidden, M = c->hc_mult;
+    static int chunk = 0;
+    if (!chunk) {
+        const char *e = getenv("GLM53F_CHUNK");
+        chunk = e ? atoi(e) : GLM53F_CPU_CHUNK;
+        if (chunk < 1) chunk = GLM53F_CPU_CHUNK;
+    }
+    const int tc = T < chunk ? T : chunk;
 
     const size_t hsz = (size_t)T * M * E;
     float *h  = (float *)malloc(hsz * sizeof(float));
-    float *sc = (float *)malloc(glm53f_layer_scratch(c, T, m->cap) * sizeof(float));
+    float *sc = (float *)malloc(glm53f_layer_scratch(c, tc, m->cap) * sizeof(float));
     float *lg = (float *)malloc((size_t)c->vocab * sizeof(float));
     float *xm = (float *)malloc((size_t)2 * E * sizeof(float));
     if (!h || !sc || !lg || !xm) {
@@ -405,9 +435,12 @@ static int forward_cpu(Glm53fModel *m, const int *ids, int T, float *logits, int
     m->layers_completed = 0;
     for (int L = 0; L < m->n_bound; L++) {
         const long drops = glm53f_expert_drops;
-        glm53f_decoder_layer(h, &m->lay[L].w, c, T, m->state + kper * (size_t)L, sc,
-                             m->kv[L], m->cached, m->cap, m->idx ? m->idx[L] : NULL,
-                             m->ckv ? m->ckv[L] : NULL);
+        for (int t0 = 0; t0 < T && glm53f_expert_drops == drops; t0 += chunk) {
+            const int n = T - t0 < chunk ? T - t0 : chunk;
+            glm53f_decoder_layer(h + (size_t)t0 * M * E, &m->lay[L].w, c, n,
+                                 m->state + kper * (size_t)L, sc, m->kv[L], m->cached + t0,
+                                 m->cap, m->idx ? m->idx[L] : NULL, m->ckv ? m->ckv[L] : NULL);
+        }
         if (glm53f_expert_drops != drops) {
             fprintf(stderr, "glm53f: routed expert load failed at layer %d; refusing partial output\n", L);
             rc = -1;

@@ -7,6 +7,24 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Interactive session, `--chat` (with `--ctx N`): the model stays loaded and each turn feeds
+  only its new tokens, reusing the KV cache, the KDA state and the indexer; reasoning dimmed,
+  answer after a separator, per-turn numbers; `/reset`, `/params`, `/gen`, `/reasoning`,
+  `/help`, `/quit`, and `/save [FILE]`, which writes the conversation as Markdown with the
+  reasoning folded.
+- `--cache-gb auto`, now the default: the expert cache takes the RAM free when the model
+  opens, minus the session's other buffers and a fifth of the installed RAM kept for the
+  system. The size used is printed.
+
+### Changed
+
+- Prefill goes layer by layer: every chunk of the prompt passes a layer before the next layer
+  starts, so each layer's routed experts are read once per prompt instead of once per chunk.
+  372-token prompt, `--gpu --cache-gb 16`: 196.1, 191.0, 192.2 s -> 118.6, 119.0, 120.1 s
+  (38% faster), 431 GB -> 257 GB of experts read, logits byte-identical. Prompts
+  up to 4096 positions are held at once (`GLM53F_SPAN`); the next layer's experts are
+  predicted during a prefill only when the cache holds two layers of them.
+
 - CUDA backend (`-DGLM53F_CUDA=ON`, `--gpu`): the trunk (KDA, MLA, mHC, dense and shared
   MLPs, lm_head) runs on NVIDIA GPUs, routed experts stay on the CPU. Decode 2.22 ->
   1.80 s/token at equal peak RSS (40 GB) on 2x RTX 3060, generated tokens identical,

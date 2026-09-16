@@ -37,7 +37,9 @@ Trunk (everything but routed experts) is resident: 12.6 GB + 2.5 GB embeddings/l
 Routed experts (25.2 MB each, FP8) stream from the SSD through an LRU cache, and each MoE
 layer predicts the next layer's experts so they are read while compute continues. With a
 24 GB cache, decode takes **2.22 s/token** (2.96 without prefetch) and an 18-token prompt
-prefills in **~31 s** (46 without), with identical output.
+prefills in **~31 s** (46 without), with identical output. Longer prompts go layer by layer,
+so each layer's experts are read once per prompt: a 372-token document prefills in 119 s
+instead of 193 with `--gpu`.
 
 With the optional CUDA backend (`-DGLM53F_CUDA=ON`, `--gpu`) the trunk runs on two RTX 3060
 12 GB cards, its RAM goes to the expert cache, and decode takes **1.80 s/token** at the
@@ -68,7 +70,14 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 ```bash
-build/Release/glm53f <model_dir> --prompt-file prompt.txt --gen 400 --cache-gb 24 --quiet
+build/Release/glm53f <model_dir> --prompt-file prompt.txt --gen 400 --quiet
+```
+
+The expert cache is sized from the free RAM unless `--cache-gb` is given. For a conversation
+that keeps the model loaded between messages (`/save` writes it as Markdown):
+
+```bash
+build/Release/glm53f <model_dir> --chat --gpu
 ```
 
 With NVIDIA GPUs:
@@ -76,7 +85,7 @@ With NVIDIA GPUs:
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DGLM53F_CUDA=ON
 cmake --build build --config Release -j
-build/Release/glm53f <model_dir> --prompt-file prompt.txt --gen 400 --gpu --cache-gb 38 --quiet
+build/Release/glm53f <model_dir> --prompt-file prompt.txt --gen 400 --gpu --quiet
 ```
 
 ## Documentation

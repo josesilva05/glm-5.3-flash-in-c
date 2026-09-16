@@ -807,6 +807,80 @@ static int move_streams(Glm53fGpu *g, int a, int b, size_t bytes)
     return 0;
 }
 
+/* One decoder layer on the streams in the h of the layer's device (the current device),
+ * for positions cached .. cached + T - 1. */
+static int layer_on_dev(Glm53fGpu *g, Glm53fModel *m, int L, int T, int cached, double *tp)
+{
+    const Glm53fCfg *c = &m->cfg;
+    const int E = c->hidden;
+    GLayer *l = &g->lay[L];
+    GDev *d = &g->dev[l->dev];
+
+    hc_pre(d, &l->attn_hc, c, T);
+    norm(d, d->xn, d->xc, l->in_norm, T, E, c->rms_eps);
+    prof_mark(PS_ATTN_HC, T);
+    if (l->is_mla) mla(d, l, c, T, cached);
+    else           kda(d, l, c, T);
+    prof_mark(l->is_mla ? PS_MLA : PS_KDA, T);
+    hc_post(d, c, T);
+    prof_mark(PS_HC_POST, T);
+
+    hc_pre(d, &l->ffn_hc, c, T);
+    norm(d, d->xn, d->xc, l->post_norm, T, E, c->rms_eps);
+    prof_mark(PS_FFN_HC, T);
+    if (l->is_dense) {
+        mlp(d, l, c, T);
+        prof_mark(PS_DENSE, T);
+    } else {
+        /* The routed experts run on the CPU while the GPU computes the shared expert. */
+        if (cudaMemcpy(g->host_x, d->xn, (size_t)T * E * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return -1;
+        prof_mark(PS_D2H, T);
+        if (prof_on && T == 1) { const double t = now_s(); prof_gpu += t - *tp; *tp = t; }
+        mlp(d, l, c, T);
+        prof_mark(PS_SHARED, T);
+        const long drops = glm53f_expert_drops;
+        g->warm_want = 1;
+        glm53f_moe_routed(g->host_r, g->host_x, &m->lay[L].w.moe, c, T, g->moe_scratch);
+        g->warm_want = 0;
+        prof_mark(PS_ROUTED, T);
+        if (prof_on && T == 1) { const double t = now_s(); prof_cpu += t - *tp; *tp = t; }
+        if (glm53f_expert_drops != drops) {
+            fprintf(stderr, "glm53f_gpu: routed expert load failed at layer %d; refusing partial output\n", L);
+            return -1;
+        }
+        if (cudaMemcpy(d->r, g->host_r, (size_t)T * E * 4, cudaMemcpyHostToDevice) != cudaSuccess) return -1;
+        gk_add(d->y, d->r, (int64_t)T * E);
+        prof_mark(PS_H2D, T);
+    }
+    hc_post(d, c, T);
+    prof_mark(PS_HC_POST, T);
+    return gk_check("layer");
+}
+
+/* Final norm and lm_head on the streams in the head device's h (the current device): the
+ * argmax of every position when argmax_all is given, the logits of the last one if asked. */
+static int head_on_dev(Glm53fGpu *g, Glm53fModel *m, int T, float *logits, int *argmax_all,
+                       int want_last)
+{
+    const Glm53fCfg *c = &m->cfg;
+    const int E = c->hidden, M = c->hc_mult, V = c->vocab;
+    GDev *d = &g->dev[g->head];
+    gk_mean_streams(d->xm, d->h, T, M, E);
+    norm(d, d->xm2, d->xm, g->norm, T, E, c->rms_eps);
+    for (int t = (argmax_all ? 0 : T - 1); t < T; t++) {
+        if (!argmax_all && !want_last) break;
+        mv(d->logits, d->xm2 + (size_t)t * E, &g->lm_head, d, 1);
+        if (cudaMemcpy(g->host_logits, d->logits, (size_t)V * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return -1;
+        if (argmax_all) {
+            int b = 0;
+            for (int i = 1; i < V; i++) if (g->host_logits[i] > g->host_logits[b]) b = i;
+            argmax_all[t] = b;
+        }
+        if (t == T - 1 && want_last && logits) memcpy(logits, g->host_logits, (size_t)V * sizeof(float));
+    }
+    return gk_check("head");
+}
+
 static int forward_chunk(Glm53fGpu *g, Glm53fModel *m, const int *ids, int T, float *logits,
                          int *argmax_all, int want_last)
 {
@@ -829,53 +903,12 @@ static int forward_chunk(Glm53fGpu *g, Glm53fModel *m, const int *ids, int T, fl
 
     m->layers_completed = 0;
     for (int L = 0; L < g->nl; L++) {
-        GLayer *l = &g->lay[L];
-        if (l->dev != cur) {
-            if (move_streams(g, cur, l->dev, hbytes) != 0) return -1;
-            cur = l->dev;
+        if (g->lay[L].dev != cur) {
+            if (move_streams(g, cur, g->lay[L].dev, hbytes) != 0) return -1;
+            cur = g->lay[L].dev;
             prof_mark(PS_MOVE, T);
         }
-        GDev *d = &g->dev[cur];
-
-        hc_pre(d, &l->attn_hc, c, T);
-        norm(d, d->xn, d->xc, l->in_norm, T, E, c->rms_eps);
-        prof_mark(PS_ATTN_HC, T);
-        if (l->is_mla) mla(d, l, c, T, m->cached);
-        else           kda(d, l, c, T);
-        prof_mark(l->is_mla ? PS_MLA : PS_KDA, T);
-        hc_post(d, c, T);
-        prof_mark(PS_HC_POST, T);
-
-        hc_pre(d, &l->ffn_hc, c, T);
-        norm(d, d->xn, d->xc, l->post_norm, T, E, c->rms_eps);
-        prof_mark(PS_FFN_HC, T);
-        if (l->is_dense) {
-            mlp(d, l, c, T);
-            prof_mark(PS_DENSE, T);
-        } else {
-            /* The routed experts run on the CPU while the GPU computes the shared expert. */
-            if (cudaMemcpy(g->host_x, d->xn, (size_t)T * E * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return -1;
-            prof_mark(PS_D2H, T);
-            if (prof_on && T == 1) { const double t = now_s(); prof_gpu += t - tp; tp = t; }
-            mlp(d, l, c, T);
-            prof_mark(PS_SHARED, T);
-            const long drops = glm53f_expert_drops;
-            g->warm_want = 1;
-            glm53f_moe_routed(g->host_r, g->host_x, &m->lay[L].w.moe, c, T, g->moe_scratch);
-            g->warm_want = 0;
-            prof_mark(PS_ROUTED, T);
-            if (prof_on && T == 1) { const double t = now_s(); prof_cpu += t - tp; tp = t; }
-            if (glm53f_expert_drops != drops) {
-                fprintf(stderr, "glm53f_gpu: routed expert load failed at layer %d; refusing partial output\n", L);
-                return -1;
-            }
-            if (cudaMemcpy(d->r, g->host_r, (size_t)T * E * 4, cudaMemcpyHostToDevice) != cudaSuccess) return -1;
-            gk_add(d->y, d->r, (int64_t)T * E);
-            prof_mark(PS_H2D, T);
-        }
-        hc_post(d, c, T);
-        prof_mark(PS_HC_POST, T);
-        if (gk_check("layer") != 0) return -1;
+        if (layer_on_dev(g, m, L, T, m->cached, &tp) != 0) return -1;
         m->layers_completed = L + 1;
     }
 
@@ -884,23 +917,8 @@ static int forward_chunk(Glm53fGpu *g, Glm53fModel *m, const int *ids, int T, fl
         cur = g->head;
         prof_mark(PS_MOVE, T);
     }
-    GDev *d = &g->dev[cur];
     if (prof_on && T == 1) { gk_sync(); const double t = now_s(); prof_gpu += t - tp; tp = t; }
-    gk_mean_streams(d->xm, d->h, T, M, E);
-    norm(d, d->xm2, d->xm, g->norm, T, E, c->rms_eps);
-    const int V = c->vocab;
-    for (int t = (argmax_all ? 0 : T - 1); t < T; t++) {
-        if (!argmax_all && !want_last) break;
-        mv(d->logits, d->xm2 + (size_t)t * E, &g->lm_head, d, 1);
-        if (cudaMemcpy(g->host_logits, d->logits, (size_t)V * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return -1;
-        if (argmax_all) {
-            int b = 0;
-            for (int i = 1; i < V; i++) if (g->host_logits[i] > g->host_logits[b]) b = i;
-            argmax_all[t] = b;
-        }
-        if (t == T - 1 && want_last && logits) memcpy(logits, g->host_logits, (size_t)V * sizeof(float));
-    }
-    if (gk_check("head") != 0) return -1;
+    if (head_on_dev(g, m, T, logits, argmax_all, want_last) != 0) return -1;
     prof_mark(PS_HEAD, T);
     if (prof_on && T == 1) {
         const double t = now_s();
@@ -911,13 +929,76 @@ static int forward_chunk(Glm53fGpu *g, Glm53fModel *m, const int *ids, int T, fl
     return 0;
 }
 
+/* A prompt longer than one chunk goes layer by layer: every chunk passes a layer before the
+ * next layer starts, so each layer's routed experts are read once for the span instead of
+ * once per chunk (glm53f_model.c, forward_cpu). The streams of the span wait in host memory
+ * and each chunk visits the layer's device; per chunk the work is exactly forward_chunk's. */
+static int forward_span(Glm53fGpu *g, Glm53fModel *m, const int *ids, int T, float *logits,
+                        int *argmax_all, int chunk)
+{
+    const Glm53fCfg *c = &m->cfg;
+    const int E = c->hidden, M = c->hc_mult;
+    const size_t per = (size_t)M * E;                    /* floats per position */
+    if (prof_on < 0) { const char *e = getenv("GLM53F_GPU_PROFILE"); prof_on = e ? atoi(e) : 0; }
+    float *H = (float *)malloc((size_t)T * per * sizeof(float));
+    if (!H) {
+        fprintf(stderr, "glm53f_gpu: cannot allocate the streams of %d positions\n", T);
+        return -1;
+    }
+    for (int t = 0; t < T; t++) {
+        float *ht = H + (size_t)t * per;
+        glm53f_embed_row(ht, &m->mb.embed, ids[t]);
+        for (int i = 1; i < M; i++) memcpy(ht + (size_t)i * E, ht, (size_t)E * sizeof(float));
+    }
+    double tp = 0.0;
+    int rc = 0;
+    m->layers_completed = 0;
+    for (int L = 0; L < g->nl && rc == 0; L++) {
+        GDev *d = &g->dev[g->lay[L].dev];
+        if (cudaSetDevice(d->id) != cudaSuccess) { rc = -1; break; }
+        for (int t0 = 0; t0 < T && rc == 0; t0 += chunk) {
+            const int n = T - t0 < chunk ? T - t0 : chunk;
+            float *ht = H + (size_t)t0 * per;
+            if (cudaMemcpy(d->h, ht, (size_t)n * per * 4, cudaMemcpyHostToDevice) != cudaSuccess ||
+                layer_on_dev(g, m, L, n, m->cached + t0, &tp) != 0 ||
+                cudaMemcpy(ht, d->h, (size_t)n * per * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
+                rc = -1;
+        }
+        if (rc == 0) m->layers_completed = L + 1;
+    }
+    if (rc == 0 && cudaSetDevice(g->dev[g->head].id) != cudaSuccess) rc = -1;
+    /* the head needs only the last chunk, unless every position's argmax is asked for */
+    for (int t0 = argmax_all ? 0 : ((T - 1) / chunk) * chunk; t0 < T && rc == 0; t0 += chunk) {
+        const int n = T - t0 < chunk ? T - t0 : chunk;
+        const int last = t0 + n == T;
+        if (cudaMemcpy(g->dev[g->head].h, H + (size_t)t0 * per, (size_t)n * per * 4,
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            head_on_dev(g, m, n, last ? logits : NULL, argmax_all ? argmax_all + t0 : NULL, last) != 0)
+            rc = -1;
+    }
+    free(H);
+    if (rc == 0) m->cached += T;
+    return rc;
+}
+
 int glm53f_gpu_forward(Glm53fGpu *g, Glm53fModel *m, const int *ids, int T, float *logits, int *argmax_all)
 {
-    for (int t0 = 0; t0 < T; t0 += g->maxT) {
-        const int n = (T - t0) < g->maxT ? (T - t0) : g->maxT;
+    /* GLM53F_CHUNK and GLM53F_SPAN lower the sizes (tests); maxT caps the chunk. */
+    static int chunk_env = -1, span = 0;
+    if (chunk_env < 0) {
+        const char *e = getenv("GLM53F_CHUNK");
+        chunk_env = e ? atoi(e) : 0;
+        e = getenv("GLM53F_SPAN");
+        span = e ? atoi(e) : GLM53F_PREFILL_SPAN;
+        if (span < 1) span = GLM53F_PREFILL_SPAN;
+    }
+    const int chunk = chunk_env > 0 && chunk_env < g->maxT ? chunk_env : g->maxT;
+    if (T <= chunk) return forward_chunk(g, m, ids, T, logits, argmax_all, 1);
+    for (int t0 = 0; t0 < T; t0 += span) {
+        const int n = (T - t0) < span ? (T - t0) : span;
         const int last = t0 + n == T;
-        if (forward_chunk(g, m, ids + t0, n, last ? logits : NULL, argmax_all ? argmax_all + t0 : NULL,
-                          last) != 0)
+        if (forward_span(g, m, ids + t0, n, last ? logits : NULL, argmax_all ? argmax_all + t0 : NULL,
+                         chunk) != 0)
             return -1;
     }
     return 0;
