@@ -89,7 +89,7 @@ if(OpenMP_C_FOUND)
 endif()
 
 # ------------------------------------------------------------------------------ cli --
-add_executable(glm53f_cli src/cli/glm53f_run.c)
+add_executable(glm53f_cli src/cli/glm53f_run.c src/cli/glm53f_chat.c)
 set_target_properties(glm53f_cli PROPERTIES OUTPUT_NAME glm53f)
 target_link_libraries(glm53f_cli PRIVATE glm53f)
 if(WIN32)

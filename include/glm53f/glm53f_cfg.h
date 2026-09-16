@@ -284,6 +284,7 @@ static inline int glm53f_cfg_load(Glm53fCfg *c, jval *root, const char *whence)
 
     int n_mla = 0, n_dense = 0;
     for (int i = 0; i < c->n_layers; i++) { n_mla += c->is_mla[i]; n_dense += c->is_dense[i]; }
+    if (!glm53f_quiet)
     printf("config: %s | hidden=%d layers=%d vocab=%d | %d MLA + %d KDA | %d dense + %d MoE "
            "(%d experts top-%d, %d shared) | mHC x%d | fp8 block %dx%d\n",
            whence, c->hidden, c->n_layers, c->vocab, n_mla, c->n_layers - n_mla, n_dense,
