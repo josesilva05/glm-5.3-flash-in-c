@@ -103,6 +103,7 @@ cache report. The JSON report holds prompt ids, generated ids and text, and the 
 |---|---|
 | `GLM53F_PREDICT_STATS=1` | report how predictable each layer's routing is |
 | `GLM53F_MTP_STATS=1` | bind the checkpoint's MTP layer, draft a token per decode step and report how often the draft equals the token the model produced (CPU path only; does not change the output) |
+| `GLM53F_CHUNK=N` | positions per prefill chunk (default 256); the output does not depend on it |
 | `GLM53F_ROUTE_TRACE=path` | append one line per decode MoE layer: layer, the 8 routed experts, microseconds waiting for reads, microseconds computing |
 
 ## GPU environment variables

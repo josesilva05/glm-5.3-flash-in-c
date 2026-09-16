@@ -117,6 +117,11 @@ if(GLM53F_CUDA)
   # Two layers per device, so the GPU gates also cross device boundaries.
   set_tests_properties(tiny_oracle PROPERTIES ENVIRONMENT "GLM53F_GPU_LAYERS_PER_DEV=2")
 endif()
+# The same gates with the prompt fed in chunks of 7 positions: a chunked prefill must
+# leave exactly the state a single pass would, so the results may not move.
+add_test(NAME tiny_oracle_chunked COMMAND test_glm_tiny ${FIX}/glm_tiny)
+set_tests_properties(tiny_oracle_chunked PROPERTIES ENVIRONMENT "GLM53F_CHUNK=7")
+
 add_test(NAME fp8_kernel COMMAND test_fp8)
 add_test(NAME config_tiny COMMAND test_cfg ${FIX}/glm_tiny/config.json)
 add_test(NAME config_released COMMAND test_cfg ${CMAKE_CURRENT_SOURCE_DIR}/config.json)
