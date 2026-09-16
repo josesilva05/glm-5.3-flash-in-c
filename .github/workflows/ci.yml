@@ -16,7 +16,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install OpenMP runtime
         if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libomp-dev
@@ -35,7 +35,7 @@ jobs:
       matrix:
         cc: [gcc, clang]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libomp-dev
       - run: make CC=${{ matrix.cc }} ARCH="-mavx2 -mfma" test -j"$(nproc)"
 
@@ -43,6 +43,6 @@ jobs:
     name: warnings as errors
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libomp-dev
       - run: make ARCH="-mavx2 -mfma" CFLAGS="-O2 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -Wno-unused-function -Werror -fopenmp -pthread -ffp-contract=off -mavx2 -mfma" all
