@@ -10,6 +10,7 @@
  * independent heads, so results do not depend on the thread count.
  */
 #include "glm53f.h"
+#include "glm53f_portable_io.h"   /* clock_gettime on Windows (C11's timespec_get is not in gnu99) */
 
 #include <math.h>
 #include <stdio.h>
@@ -935,7 +936,7 @@ static struct {
     int  prev[GLM53F_MAX_LAYERS][GLM53F_MAX_TOPK];
     int  have_prev[GLM53F_MAX_LAYERS];
     long steps, p1k, p12k, p2, both, need;
-} glm53f_ps = { -1 };
+} glm53f_ps = { .on = -1 };
 
 static void route_topn(int *idx, int n, const float *x, const float *gate, const float *bias,
                        const Glm53fCfg *c)
@@ -1110,7 +1111,7 @@ static void moe_chunk(float *out, const float *x, const Glm53fMoeW *w, const Glm
         trace_on = trace != NULL;
     }
     double tr_wait = 0.0, tr_comp = 0.0;
-    struct timespec tr_a, tr_b;
+    struct timespec tr_a, tr_b;   /* clock_gettime: C11's timespec_get is not in gnu99 */
 
     for (int b0 = 0; b0 < nu; b0 += GLM53F_MOE_BATCH) {
         const int bn = (nu - b0) < GLM53F_MOE_BATCH ? (nu - b0) : GLM53F_MOE_BATCH;
@@ -1118,10 +1119,10 @@ static void moe_chunk(float *out, const float *x, const Glm53fMoeW *w, const Glm
         for (int u = b0; u < b0 + bn; u++) {
             const int e = uniq[u];
             Glm53fExpertQ q;
-            if (trace_on) timespec_get(&tr_a, TIME_UTC);
+            if (trace_on) clock_gettime(CLOCK_MONOTONIC, &tr_a);
             const int got = w->src->get(w->src, w->layer, e, &q);
             if (trace_on) {
-                timespec_get(&tr_b, TIME_UTC);
+                clock_gettime(CLOCK_MONOTONIC, &tr_b);
                 tr_wait += (double)(tr_b.tv_sec - tr_a.tv_sec) * 1e6 + (double)(tr_b.tv_nsec - tr_a.tv_nsec) / 1e3;
             }
             if (got != 0) {
@@ -1144,7 +1145,7 @@ static void moe_chunk(float *out, const float *x, const Glm53fMoeW *w, const Glm
                     glm53f_mm(contrib + ((size_t)t * K + j) * E, act, &q.down);
                 }
             if (trace_on) {
-                timespec_get(&tr_a, TIME_UTC);
+                clock_gettime(CLOCK_MONOTONIC, &tr_a);
                 tr_comp += (double)(tr_a.tv_sec - tr_b.tv_sec) * 1e6 + (double)(tr_a.tv_nsec - tr_b.tv_nsec) / 1e3;
             }
             if (w->src->release) w->src->release(w->src, w->layer, e);
