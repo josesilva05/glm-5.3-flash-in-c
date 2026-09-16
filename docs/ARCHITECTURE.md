@@ -195,7 +195,37 @@ Wasted reads are expensive because the disk is the bottleneck: predicting 16 exp
 layer made decode slower than no prefetch at all. N = 6 with 2 readers measured best for
 decode and is also the best measured per-token prediction count for prefill.
 
-### 2.6 CUDA backend (`--gpu`)
+### 2.6 DSA: which positions a query attends to
+
+`Glm5NextTextIndexer`, implemented in `src/core/glm53f_dsa.c`. Per MLA layer and position it
+keeps a light key and a gate vector:
+
+```
+k_j    = LayerNorm(wk . x_j, k_norm, eps 1e-6)                 [index_dim = 128]
+g_j    = index_kpool_compress_gate . x_j                       [index_dim]
+pool p = positions [4p, 4p+4), complete pools only
+P_p[c] = sum_j softmax_j(g_[4p+j][c] + ape[j][c]) * k_[4p+j][c]   (softmax per channel)
+q_t    = wq_b . q_resid_t                                      [32][128]
+w_t    = (weights_proj . x_t) / sqrt(32)                       [32]
+s_t[p] = sum_h w_t[h] * relu(q_t[h] . P_p / sqrt(128))
+```
+
+The `index_topk / index_kpool` = 512 best pools become 2048 positions, and the incomplete
+tail pool (up to 3 positions) is always appended, so a query attends to at most 2051 of
+them. While the complete pools fit in the budget every visible position is selected: that
+is the dense regime the engine was limited to before, and the selection is skipped there,
+which keeps those sessions bit-identical to the previous engine.
+
+State per MLA layer is `2*cap*128 + cap/4*128` floats (1.15 KB per position per layer,
+12.7 KB per position over the 11 MLA layers), against 1.44 MB per position for the KV
+cache, which remains what bounds a long session.
+
+Validation: `test_glm_tiny` GATE 4 runs a 40-position session on the tiny model, whose
+`index_topk` of 16 makes the indexer select from position 19 on, and matches the reference
+at all 40 positions. `--gpu` keeps its dense kernels, so it refuses sessions longer than
+the dense-equivalent range and leaves the trunk on the CPU.
+
+### 2.7 CUDA backend (`--gpu`)
 
 Built with `-DGLM53F_CUDA=ON`. The trunk moves to the GPUs; routed experts stay where the
 bytes are, on the CPU with the cache and prefetch of 2.4-2.5.
@@ -241,7 +271,7 @@ Validation: `test_glm_tiny` GATE G1-G3 repeat the reference checks with the trun
 GPU and layers split across devices; on the real checkpoint the 45-layer logits stay within
 2.1e-5 of the reference and 40 greedy tokens match the CPU run (VALIDATION.md 2.2).
 
-### 2.7 MTP layer (multi-token prediction)
+### 2.8 MTP layer (multi-token prediction)
 
 `GLM53F_MTP_STATS=1` binds checkpoint layer `n_layers` ("nextn"), which the released
 transformers does not implement (it skips `layers.45.`). From the hidden state of position
@@ -262,7 +292,7 @@ reference implementation safe to run. Today the engine only measures it (88.6% o
 match; see PERFORMANCE.md for why speculation is not worth it on this machine). The layer
 needs the lm_head on the host, so it is unavailable together with `--gpu`.
 
-### 2.8 Failure policy
+### 2.9 Failure policy
 
 A wrong model that prints fluent text is the failure this engine is built to avoid:
 

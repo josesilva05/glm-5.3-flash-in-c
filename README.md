@@ -48,9 +48,10 @@ same peak RSS (`--cache-gb 38`), with the same generated tokens; see
 
 - **mHC** residual: 4 streams; per sub-block, learned collapse weights and a Sinkhorn-normalised 4x4 mixer.
 - **KDA** (34 layers): gated delta rule with per-channel decay, short conv, low-rank output gate.
-- **MLA** (11 layers): NoPE, no output gate. Attention is dense, which equals the model's
-  DeepSeek Sparse Attention exactly up to `index_topk + index_kpool - 1` = **2051 positions**;
-  longer sessions are refused rather than computed differently.
+- **MLA** (11 layers): NoPE, no output gate, with the model's **DeepSeek Sparse Attention**:
+  the indexer scores pools of 4 positions and keeps the 2048 best plus the tail, so a query
+  attends to at most 2051 positions of any context. Up to 2051 positions that selection is
+  everything, and the engine runs the dense path it always did.
 - **MoE** (42 layers): 288 experts, top-8, sigmoid router with correction bias, 1 shared expert;
   3 dense layers; SwiGLU clamped at 10.
 - **FP8 E4M3** block-scaled matrices multiplied straight from the codes; BF16 elsewhere.

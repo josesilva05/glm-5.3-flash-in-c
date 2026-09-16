@@ -26,6 +26,7 @@ typedef struct Glm53fModel {
     int              cached;         /* positions consumed so far    */
     float           *state;          /* [n_bound][kda_state_floats]  */
     float          **kv;             /* [n_bound] -> [cap][H*(qk_nope+v_head)], NULL on KDA layers */
+    float          **idx;            /* [n_bound] -> DSA indexer state, NULL on KDA layers   */
 
     int              layers_completed;
     double           load_seconds;

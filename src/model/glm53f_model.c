@@ -52,13 +52,9 @@ int glm53f_model_open(Glm53fModel *m, const char *dir, const char *cfg_path, dou
     Glm53fCfg *c = &m->cfg;
 
     if (cap < 1) cap = 1;
-    if (cap > glm53f_dense_attn_limit(c)) {
-        fprintf(stderr,
-                "glm53f: %d positions requested, but this engine computes attention densely and "
-                "that equals the model's sparse (DSA) attention only up to %d positions "
-                "(index_topk %d + index_kpool %d - 1). Refusing rather than computing a "
-                "different model; shorten the prompt or --gen.\n",
-                cap, glm53f_dense_attn_limit(c), c->index_topk, c->index_kpool);
+    if (cap > GLM53F_MAX_POSITIONS) {
+        fprintf(stderr, "glm53f: %d positions requested, above this build's limit of %d\n",
+                cap, GLM53F_MAX_POSITIONS);
         return -1;
     }
     m->cap = cap;
@@ -146,24 +142,28 @@ int glm53f_model_open(Glm53fModel *m, const char *dir, const char *cfg_path, dou
 
     m->state = (float *)calloc(glm53f_kda_state_floats(c) * (size_t)m->n_bound, sizeof(float));
     m->kv = (float **)calloc((size_t)m->n_bound, sizeof(float *));
-    if (!m->state || !m->kv) { glm53f_model_close(m); return -1; }
-    size_t kvb = 0;
+    m->idx = (float **)calloc((size_t)m->n_bound, sizeof(float *));
+    if (!m->state || !m->kv || !m->idx) { glm53f_model_close(m); return -1; }
+    size_t kvb = 0, idxb = 0;
     for (L = 0; L < m->n_bound; L++) {
         if (!glm53f_is_mla(c, L)) continue;
         const size_t n = (size_t)cap * glm53f_kv_floats_per_pos(c);
+        const size_t ni = glm53f_dsa_state_floats(c, cap);
         m->kv[L] = (float *)malloc(n * sizeof(float));
-        if (!m->kv[L]) {
+        m->idx[L] = (float *)calloc(ni, sizeof(float));
+        if (!m->kv[L] || !m->idx[L]) {
             fprintf(stderr, "glm53f: cannot allocate the KV cache (%.2f GB per MLA layer)\n",
                     (double)n * 4 / 1e9);
             glm53f_model_close(m); return -1;
         }
         kvb += n * sizeof(float);
+        idxb += ni * sizeof(float);
     }
-    printf("expert cache: %d slots x %.2f MB = %.2f GB | KV cache %.2f GB for %d positions | "
-           "KDA state %.2f MB\n\n",
+    printf("expert cache: %d slots x %.2f MB = %.2f GB | KV cache %.2f GB + DSA index %.2f GB "
+           "for %d positions | KDA state %.2f MB\n\n",
            m->cache.nslot, (double)m->cache.slot_bytes / 1e6,
-           (double)m->cache.nslot * m->cache.slot_bytes / 1e9, (double)kvb / 1e9, cap,
-           (double)glm53f_model_state_bytes(m) / 1e6);
+           (double)m->cache.nslot * m->cache.slot_bytes / 1e9, (double)kvb / 1e9,
+           (double)idxb / 1e9, cap, (double)glm53f_model_state_bytes(m) / 1e6);
     return 0;
 }
 
@@ -178,6 +178,8 @@ void glm53f_model_close(Glm53fModel *m)
     free(m->lay);
     if (m->kv) for (int L = 0; L < m->n_bound; L++) free(m->kv[L]);
     free(m->kv);
+    if (m->idx) for (int L = 0; L < m->n_bound; L++) free(m->idx[L]);
+    free(m->idx);
     free(m->state);
     glm53f_bind_model_free(&m->mb);
     free(m->routers);
@@ -261,6 +263,14 @@ int glm53f_model_use_gpu(Glm53fModel *m, const int *devices, int ndev)
         fprintf(stderr, "glm53f: no CUDA device found; running on the CPU\n");
         return -1;
     }
+    /* The device attention kernels are dense; the DSA indexer runs on the CPU path only. */
+    if (m->cap > glm53f_dense_attn_limit(&m->cfg)) {
+        fprintf(stderr, "glm53f: --gpu handles up to %d positions (dense attention equals the "
+                        "model's sparse attention there); this session holds %d, so the trunk "
+                        "stays on the CPU, where the DSA indexer runs.\n",
+                glm53f_dense_attn_limit(&m->cfg), m->cap);
+        return -1;
+    }
     m->gpu = glm53f_gpu_create(m, devices, ndev);
     if (!m->gpu) return -1;
     release_host_trunk(m);
@@ -321,7 +331,7 @@ int glm53f_model_forward(Glm53fModel *m, const int *ids, int T, float *logits, i
     for (int L = 0; L < m->n_bound; L++) {
         const long drops = glm53f_expert_drops;
         glm53f_decoder_layer(h, &m->lay[L].w, c, T, m->state + kper * (size_t)L, sc,
-                             m->kv[L], m->cached, m->cap);
+                             m->kv[L], m->cached, m->cap, m->idx ? m->idx[L] : NULL);
         if (glm53f_expert_drops != drops) {
             fprintf(stderr, "glm53f: routed expert load failed at layer %d; refusing partial output\n", L);
             rc = -1;

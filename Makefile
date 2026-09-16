@@ -39,8 +39,9 @@ LDFLAGS ?= -lm $(OMP_LDFLAGS) -pthread
 INCLUDES := -Iinclude -Iinclude/glm53f -Ithird_party \
             -Isrc/core -Isrc/io -Isrc/cache -Isrc/model -Isrc/tokenizer
 
-ENGINE_SRC := src/core/glm53f_ops.c src/io/glm53f_st.c src/io/glm53f_load.c \
-              src/cache/glm53f_cache.c src/model/glm53f_bind.c src/model/glm53f_model.c
+ENGINE_SRC := src/core/glm53f_ops.c src/core/glm53f_dsa.c src/io/glm53f_st.c \
+              src/io/glm53f_load.c src/cache/glm53f_cache.c src/model/glm53f_bind.c \
+              src/model/glm53f_model.c src/model/glm53f_mtp.c
 ENGINE_OBJ := $(patsubst %.c,$(BUILD)/%.o,$(ENGINE_SRC))
 
 TESTS := test_glm_tiny test_cfg test_st test_tok

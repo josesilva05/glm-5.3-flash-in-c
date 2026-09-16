@@ -123,8 +123,8 @@ static void usage(FILE *f)
 "  --quiet               no per-step table\n"
 "  --version, --help\n"
 "\n"
-"Attention is computed densely, which equals the model's DeepSeek Sparse Attention\n"
-"exactly up to index_topk + index_kpool - 1 positions (2051); longer sessions are refused.\n");
+"Beyond index_topk + index_kpool - 1 positions (2051) the DSA indexer selects which\n"
+"positions each query attends to, as the model does; --gpu is limited to that dense range.\n");
 }
 
 int main(int argc, char **argv)

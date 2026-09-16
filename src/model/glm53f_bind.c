@@ -9,7 +9,7 @@
 #include "glm53f_bind.h"
 
 #define PRE "model.language_model."
-#define MAXR 64
+#define MAXR 80
 
 typedef struct {
     char               name[200];
@@ -161,6 +161,16 @@ static void plan_layer(Plan *p, const Glm53fCfg *c, int L, Glm53fLayerW *w)
         req_mat(p, &a->kv_b, H * (c->qk_nope + c->v_head), c->kv_lora,
                 PRE "layers.%d.self_attn.kv_b_proj.weight", L);
         req_mat(p, &a->o, E, H * c->v_head, PRE "layers.%d.self_attn.o_proj.weight", L);
+        Glm53fIdxW *ix = &a->idx;
+        const int64_t IH = c->index_heads, ID = c->index_dim;
+        req_mat(p, &ix->wq_b, IH * ID, c->q_lora, PRE "layers.%d.self_attn.indexer.wq_b.weight", L);
+        req_mat(p, &ix->wk, ID, E, PRE "layers.%d.self_attn.indexer.wk.weight", L);
+        req_vec(p, &ix->k_norm_w, ID, 0, PRE "layers.%d.self_attn.indexer.k_norm.weight", L);
+        req_vec(p, &ix->k_norm_b, ID, 0, PRE "layers.%d.self_attn.indexer.k_norm.bias", L);
+        req_mat(p, &ix->wproj, IH, E, PRE "layers.%d.self_attn.indexer.weights_proj.weight", L);
+        req_mat(p, &ix->gate, ID, E, PRE "layers.%d.self_attn.indexer.index_kpool_compress_gate", L);
+        req_vec(p, &ix->ape, (int64_t)c->index_kpool * ID, 0,
+                PRE "layers.%d.self_attn.indexer.index_kpool_compress_ape", L);
     } else {
         const int64_t H = c->kda_heads, D = c->kda_head_dim, P = H * D;
         Glm53fKdaW *k = &w->kda;
@@ -219,6 +229,16 @@ static void plan_mtp(Plan *p, const Glm53fCfg *c, Glm53fMtpW *w)
     req_mat(p, &a->kv_b, (int64_t)H * (c->qk_nope + c->v_head), c->kv_lora,
             PRE "layers.%d.self_attn.kv_b_proj.weight", L);
     req_mat(p, &a->o, E, (int64_t)H * c->v_head, PRE "layers.%d.self_attn.o_proj.weight", L);
+        Glm53fIdxW *ix = &a->idx;
+        const int64_t IH = c->index_heads, ID = c->index_dim;
+        req_mat(p, &ix->wq_b, IH * ID, c->q_lora, PRE "layers.%d.self_attn.indexer.wq_b.weight", L);
+        req_mat(p, &ix->wk, ID, E, PRE "layers.%d.self_attn.indexer.wk.weight", L);
+        req_vec(p, &ix->k_norm_w, ID, 0, PRE "layers.%d.self_attn.indexer.k_norm.weight", L);
+        req_vec(p, &ix->k_norm_b, ID, 0, PRE "layers.%d.self_attn.indexer.k_norm.bias", L);
+        req_mat(p, &ix->wproj, IH, E, PRE "layers.%d.self_attn.indexer.weights_proj.weight", L);
+        req_mat(p, &ix->gate, ID, E, PRE "layers.%d.self_attn.indexer.index_kpool_compress_gate", L);
+        req_vec(p, &ix->ape, (int64_t)c->index_kpool * ID, 0,
+                PRE "layers.%d.self_attn.indexer.index_kpool_compress_ape", L);
     const int64_t SI = (int64_t)c->moe_inter * c->n_shared;
     req_vec(p, &lw->moe.gate, (int64_t)c->n_experts * E, 0, PRE "layers.%d.mlp.gate.weight", L);
     req_vec(p, &lw->moe.bias, c->n_experts, 0, PRE "layers.%d.mlp.gate.e_score_correction_bias", L);

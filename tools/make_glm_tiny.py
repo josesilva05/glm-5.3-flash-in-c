@@ -12,7 +12,8 @@ and the reference see exactly the same effective model.
   .venv/Scripts/python tools/make_glm_tiny.py tests/fixtures/glm_tiny
 
 Writes config.json, model.safetensors and ref.json (prompt ids, last-position logits,
-greedy continuation, teacher-forced argmax at every position).
+greedy continuation, teacher-forced argmax at every position, and a 40-position session
+whose length forces the DSA indexer to select rather than attend densely).
 """
 import json
 import os
@@ -180,6 +181,12 @@ def main():
             return lm_head(h)[0]
 
     lg = logits_all(ids)
+    # A session long enough that the DSA indexer really selects: with index_topk 16 and
+    # index_kpool 4 the reference attends densely up to 19 positions, so 40 positions make
+    # it score pools and drop tokens. The engine must follow it exactly there too.
+    long_ids = [(i * 7 + 3) % (TEXT["vocab_size"] - 4) + 3 for i in range(40)]
+    long_lg = logits_all(long_ids)
+    long_tf = long_lg.argmax(-1).tolist()
     seq = list(ids)
     for _ in range(n_gen):
         seq.append(int(logits_all(seq)[-1].argmax()))
@@ -193,7 +200,9 @@ def main():
                                     "quant_method": "fp8", "weight_block_size": BLOCK}}
     json.dump(full, open(os.path.join(out, "config.json"), "w"), indent=1)
     json.dump({"prompt_ids": ids, "logits_last": [float(x) for x in lg[-1]],
-               "generated_ids": seq[len(ids):], "full_ids": seq, "tf_argmax": tf},
+               "generated_ids": seq[len(ids):], "full_ids": seq, "tf_argmax": tf,
+               "long_ids": long_ids, "long_tf_argmax": long_tf,
+               "long_logits_last": [float(x) for x in long_lg[-1]]},
               open(os.path.join(out, "ref.json"), "w"), indent=1)
     print(f"wrote {out}: {len(tensors)} tensors, prompt {len(ids)} ids, generated {seq[len(ids):]}")
 

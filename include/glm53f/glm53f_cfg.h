@@ -125,6 +125,26 @@ static inline int glm53f_cfg_load(Glm53fCfg *c, jval *root, const char *whence)
     c->v_head      = glm53f_cfg_i(&s, T, "v_head_dim", whence);
     c->index_topk  = glm53f_cfg_i(&s, T, "index_topk", whence);
     c->index_kpool = glm53f_cfg_i(&s, T, "index_kpool", whence);
+    c->index_heads = glm53f_cfg_i(&s, T, "index_n_heads", whence);
+    c->index_dim   = glm53f_cfg_i(&s, T, "index_head_dim", whence);
+    {   /* the tail pool is appended to the selection; the engine implements that form */
+        jval *v = json_get(T, "index_kpool_always_select_tail");
+        c->index_tail = v && v->t == J_BOOL ? v->boolean : 1;
+        jval *cp = json_get(T, "index_kpool_compress");
+        if (cp && cp->t == J_BOOL && !cp->boolean) {
+            fprintf(stderr, "glm53f_cfg: %s: index_kpool_compress false is not implemented\n", whence);
+            s.bad++;
+        }
+        jval *it = json_get(T, "indexer_types");
+        if (it && it->t == J_ARR)
+            for (int i = 0; i < it->len; i++)
+                if (!it->kids[i] || it->kids[i]->t != J_STR || strcmp(it->kids[i]->str, "full") != 0) {
+                    fprintf(stderr, "glm53f_cfg: %s: indexer_types[%d] is not 'full'; cross-layer "
+                                    "top-k sharing is not implemented\n", whence, i);
+                    s.bad++;
+                    break;
+                }
+    }
     glm53f_cfg_expect_int(&s, T, "qk_rope_head_dim", 0, whence);          /* NoPE */
     {
         const int kvh = glm53f_cfg_i(&s, T, "num_key_value_heads", whence);
@@ -249,6 +269,11 @@ static inline int glm53f_cfg_load(Glm53fCfg *c, jval *root, const char *whence)
     }
     if (c->conv_k < 1 || c->conv_k > 17 || c->kda_head_dim > 512 || c->v_head > 1024) {
         fprintf(stderr, "glm53f_cfg: %s: conv kernel / head dims outside supported bounds\n", whence);
+        return 0;
+    }
+    if (c->index_heads < 1 || c->index_heads > 256 || c->index_dim < 1 || c->index_dim > 512) {
+        fprintf(stderr, "glm53f_cfg: %s: index_n_heads %d / index_head_dim %d outside bounds\n",
+                whence, c->index_heads, c->index_dim);
         return 0;
     }
     if (c->index_kpool < 1 || c->index_topk < c->index_kpool) {

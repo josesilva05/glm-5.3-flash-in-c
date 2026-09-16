@@ -107,13 +107,33 @@ int main(int argc, char **argv)
     CHECK(match == nf, "GATE 3 teacher forcing   %d/%d positions match the reference argmax", match, nf);
     glm53f_model_close(&m);
 
-    /* GATE 4 */
+    /* GATE 4: DSA. The tiny config keeps index_topk / index_kpool = 4 pools, so from
+     * position 19 on the indexer must drop tokens instead of attending densely. The
+     * reference ran the same 40 positions with its own indexer. */
+    int long_ids[128], long_tf[128];
+    const int nl = ints(json_get(ref, "long_ids"), long_ids, 128);
+    const int nlt = ints(json_get(ref, "long_tf_argmax"), long_tf, 128);
+    jval *ll = json_get(ref, "long_logits_last");
     Glm53fModel m2;
-    const int limit = 16 + 4 - 1;   /* index_topk + index_kpool - 1 in the tiny config */
-    const int refused = glm53f_model_open(&m2, dir, NULL, 0.01, -1, limit + 1, 0, 0, 0) != 0;
-    if (!refused) glm53f_model_close(&m2);
-    CHECK(refused, "GATE 4 refusal           a %d-position session beyond the dense-attention limit %d is refused",
-          limit + 1, limit);
+    int dsa_match = -1;
+    double dsa_worst = 0.0;
+    if (nl > 0 && nlt == nl && ll && ll->t == J_ARR &&
+        glm53f_model_open(&m2, dir, NULL, 0.01, -1, nl, 0, 0, 0) == 0) {
+        int arg2[128];
+        if (glm53f_model_forward(&m2, long_ids, nl, lg, arg2) == 0) {
+            dsa_match = 0;
+            for (int i = 0; i < nl; i++) dsa_match += arg2[i] == long_tf[i];
+            for (int i = 0; i < m2.cfg.vocab && i < ll->len; i++) {
+                const double r = ll->kids[i]->num;
+                const double d = fabs(r - lg[i]) / (1e-5 + 1e-4 * fabs(r));
+                if (d > dsa_worst) dsa_worst = d;
+            }
+        }
+        glm53f_model_close(&m2);
+    }
+    CHECK(dsa_match == nl && dsa_worst <= 1.0,
+          "GATE 4 sparse attention  %d/%d positions past the dense limit %d match the reference "
+          "(logits worst %.3fx tolerance)", dsa_match < 0 ? 0 : dsa_match, nl, 16 + 4 - 1, dsa_worst);
 
     /* GATE 5: the same decode with predictive prefetch and a cache too small for the 24
      * experts, so background reads, waits on in-flight reads, pins and evictions all

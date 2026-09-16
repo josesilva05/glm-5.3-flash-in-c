@@ -70,6 +70,9 @@ typedef struct {
     int   v_head;            /* 256    */
     int   index_topk;        /* 2048   */
     int   index_kpool;       /* 4      */
+    int   index_heads;       /* 32     */
+    int   index_dim;         /* 128    */
+    int   index_tail;        /* index_kpool_always_select_tail */
 
     /* feed-forward */
     int   n_experts;         /* 288    */
@@ -182,9 +185,22 @@ typedef struct {
     Glm53fMat    o;                    /* [hidden][H*D]                       */
 } Glm53fKdaW;
 
+/* DSA indexer of one MLA layer (Glm5NextTextIndexer). Scores pools of index_kpool
+ * consecutive positions and keeps the index_topk / index_kpool best ones for each query,
+ * plus the incomplete tail pool. */
+typedef struct {
+    Glm53fMat    wq_b;                 /* [index_heads*index_dim][q_lora]      */
+    Glm53fMat    wk;                   /* [index_dim][hidden]                  */
+    Glm53fMat    wproj;                /* [index_heads][hidden]                */
+    Glm53fMat    gate;                 /* [index_dim][hidden], k-pool compress */
+    const float *k_norm_w, *k_norm_b;  /* LayerNorm of wk, eps 1e-6            */
+    const float *ape;                  /* [index_kpool][index_dim]             */
+} Glm53fIdxW;
+
 typedef struct {
     Glm53fMat    q_a, q_b, kv_a, kv_b, o;
     const float *q_a_norm, *kv_a_norm;
+    Glm53fIdxW   idx;                  /* DSA indexer of this layer            */
 } Glm53fMlaW;
 
 /* One routed expert as the cache serves it: three FP8 (or BF16/F32) matrices. */
@@ -231,6 +247,7 @@ typedef struct {
     Glm53fMat    d_gate, d_up, d_down;  /* dense MLP */
 } Glm53fLayerW;
 
+
 /* Multi-token prediction head (checkpoint layer n_layers, "MTP"/nextn). One MLA + MoE
  * layer without mHC: from the hidden state of position i and the embedding of the token at
  * i+1 it predicts the token at i+2, which speculative decoding uses as a draft. */
@@ -262,7 +279,24 @@ void   glm53f_kda_layer(float *out, const float *x, const Glm53fKdaW *w, const G
  * attended over and this call's T positions are appended at [cached, cached+T). */
 size_t glm53f_mla_scratch(const Glm53fCfg *c, int T, int cap);
 void   glm53f_mla(float *out, const float *x, const Glm53fMlaW *w, const Glm53fCfg *c,
-                  int T, float *scratch, float *kvc, int cached, int cap);
+                  int T, float *scratch, float *kvc, int cached, int cap, float *istate);
+
+/* ---- DSA indexer (glm53f_dsa.c) ----
+ * State per MLA layer: glm53f_dsa_state_floats(c, cap). Append the T new positions before
+ * attention, then ask for the positions each query may attend to. */
+static inline size_t glm53f_dsa_state_floats(const Glm53fCfg *c, int cap)
+{
+    return (size_t)2 * (size_t)cap * (size_t)c->index_dim +
+           (size_t)((cap + c->index_kpool - 1) / c->index_kpool) * (size_t)c->index_dim;
+}
+size_t glm53f_dsa_scratch(const Glm53fCfg *c, int cap);
+void   glm53f_dsa_append(float *state, const float *x, const Glm53fIdxW *w, const Glm53fCfg *c,
+                         int T, int cached, int cap, float *scratch);
+/* Positions the query at absolute position p attends to, ascending, into sel (at most
+ * index_topk + index_kpool - 1 entries). Returns the count, or -1 when every visible
+ * position is selected (the caller then runs the dense path, which is identical). */
+int    glm53f_dsa_select(int *sel, float *state, const float *x_t, const float *q_resid,
+                         const Glm53fIdxW *w, const Glm53fCfg *c, int p, int cap, float *scratch);
 
 /* Router: idx/w written with topk entries, weights from the UNBIASED sigmoid scores. */
 void glm53f_router(int *idx, float *w, const float *x, const Glm53fMoeW *m, const Glm53fCfg *c);
@@ -284,7 +318,8 @@ void   glm53f_mlp(float *out, const float *x, const Glm53fMat *gate, const Glm53
  * kvc/cached/cap are used by MLA layers only (kvc NULL on KDA layers). */
 size_t glm53f_layer_scratch(const Glm53fCfg *c, int T, int cap);
 void   glm53f_decoder_layer(float *h, const Glm53fLayerW *w, const Glm53fCfg *c, int T,
-                            float *state, float *scratch, float *kvc, int cached, int cap);
+                            float *state, float *scratch, float *kvc, int cached, int cap,
+                            float *istate);
 
 /* Recurrent + conv state floats for one KDA layer. */
 static inline size_t glm53f_kda_state_floats(const Glm53fCfg *c)
@@ -299,6 +334,9 @@ static inline size_t glm53f_kv_floats_per_pos(const Glm53fCfg *c)
     return (size_t)c->n_heads * (size_t)(c->qk_nope + c->v_head);
 }
 
+/* Positions one session may hold. Beyond index_topk + index_kpool - 1 the DSA indexer
+ * selects (glm53f_dsa.c); the ceiling here is the KV cache, which grows linearly. */
+#define GLM53F_MAX_POSITIONS 32768
 #define GLM53F_MAX_PROMPT 32768
 #define GLM53F_MAX_GEN     8192
 

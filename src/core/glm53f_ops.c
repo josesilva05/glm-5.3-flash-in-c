@@ -691,14 +691,16 @@ void glm53f_kda_layer(float *out, const float *x, const Glm53fKdaW *w, const Glm
 size_t glm53f_mla_scratch(const Glm53fCfg *c, int T, int cap)
 {
     const size_t H = (size_t)c->n_heads;
-    return (size_t)T * H * c->qk_nope      /* q                       */
-         + (size_t)c->q_lora + (size_t)c->kv_lora
-         + (size_t)T * H * c->v_head       /* attention output        */
-         + H * (size_t)(cap > T ? cap : T);/* per-head score rows     */
+    return (size_t)T * H * c->qk_nope      /* q                             */
+         + (size_t)T * c->q_lora + (size_t)c->kv_lora  /* q residual per query */
+         + (size_t)T * H * c->v_head       /* attention output              */
+         + H * (size_t)(cap > T ? cap : T) /* per-head score rows           */
+         + glm53f_dsa_scratch(c, cap)      /* indexer                       */
+         + (size_t)(c->index_topk + c->index_kpool);   /* selected positions */
 }
 
 void glm53f_mla(float *out, const float *x, const Glm53fMlaW *w, const Glm53fCfg *c,
-                int T, float *scratch, float *kvc, int cached, int cap)
+                int T, float *scratch, float *kvc, int cached, int cap, float *istate)
 {
     const int E = c->hidden, H = c->n_heads, qn = c->qk_nope, vh = c->v_head;
     const int kvd = qn + vh;
@@ -708,23 +710,36 @@ void glm53f_mla(float *out, const float *x, const Glm53fMlaW *w, const Glm53fCfg
 
     float *q   = scratch;
     float *ql  = q  + (size_t)T * H * qn;
-    float *ct  = ql + c->q_lora;
+    float *ct  = ql + (size_t)T * c->q_lora;
     float *acc = ct + c->kv_lora;
     float *sc  = acc + (size_t)T * H * vh;
+    float *ds  = sc + (size_t)H * (size_t)(cap > T ? cap : T);
+    int   *sel = (int *)(void *)(ds + glm53f_dsa_scratch(c, cap));
 
     for (int t = 0; t < T; t++) {
         const float *xt = x + (size_t)t * E;
-        glm53f_mm(ql, xt, &w->q_a);
-        glm53f_rmsnorm(ql, ql, w->q_a_norm, c->q_lora, c->rms_eps);
-        glm53f_mm(q + (size_t)t * H * qn, ql, &w->q_b);
+        float *qlt = ql + (size_t)t * c->q_lora;
+        glm53f_mm(qlt, xt, &w->q_a);
+        glm53f_rmsnorm(qlt, qlt, w->q_a_norm, c->q_lora, c->rms_eps);
+        glm53f_mm(q + (size_t)t * H * qn, qlt, &w->q_b);
         glm53f_mm(ct, xt, &w->kv_a);
         glm53f_rmsnorm(ct, ct, w->kv_a_norm, c->kv_lora, c->rms_eps);
         glm53f_mm(kvc + (size_t)(cached + t) * H * kvd, ct, &w->kv_b);
     }
 
+    /* The indexer sees every position, including the ones this call appends. */
+    if (istate) glm53f_dsa_append(istate, x, &w->idx, c, T, cached, cap, ds);
+
     const int nb = cached + T;
     for (int t = 0; t < T; t++) {
         const int p = cached + t;
+        /* Positions this query attends to: all of them (nsel < 0), or the indexer's
+         * selection in ascending order, so the dense case keeps the same order of sums. */
+        const int nsel = istate ? glm53f_dsa_select(sel, istate, x + (size_t)t * E,
+                                                    ql + (size_t)t * c->q_lora, &w->idx, c,
+                                                    p, cap, ds)
+                                : -1;
+        const int nvis = nsel < 0 ? p + 1 : nsel;
         int h;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -733,22 +748,24 @@ void glm53f_mla(float *out, const float *x, const Glm53fMlaW *w, const Glm53fCfg
             const float *qt = q + ((size_t)t * H + h) * qn;
             float *s = sc + (size_t)h * nb;
             double m = -INFINITY;
-            for (int j = 0; j <= p; j++) {
+            for (int jj = 0; jj < nvis; jj++) {
+                const int j = nsel < 0 ? jj : sel[jj];
                 const float *kj = kvc + ((size_t)j * H + h) * kvd;
                 double d = 0.0;
                 for (int i = 0; i < qn; i++) d += (double)qt[i] * (double)kj[i];
                 d *= scale;
-                s[j] = (float)d;
+                s[jj] = (float)d;
                 if (d > m) m = d;
             }
             double z = 0.0;
-            for (int j = 0; j <= p; j++) z += exp((double)s[j] - m);
+            for (int jj = 0; jj < nvis; jj++) z += exp((double)s[jj] - m);
             float *o = acc + ((size_t)t * H + h) * vh;
             double tmp[1024];
             if (vh > 1024) glm53f_fatal_bound("MLA value head dim", vh, 1024);
             for (int i = 0; i < vh; i++) tmp[i] = 0.0;
-            for (int j = 0; j <= p; j++) {
-                const double pr = exp((double)s[j] - m) / z;
+            for (int jj = 0; jj < nvis; jj++) {
+                const int j = nsel < 0 ? jj : sel[jj];
+                const double pr = exp((double)s[jj] - m) / z;
                 const float *vj = kvc + ((size_t)j * H + h) * kvd + qn;
                 for (int i = 0; i < vh; i++) tmp[i] += pr * (double)vj[i];
             }
@@ -1127,7 +1144,8 @@ static void hc_site_post(float *h, const float *y, const float *post, const floa
 }
 
 void glm53f_decoder_layer(float *h, const Glm53fLayerW *w, const Glm53fCfg *c, int T,
-                          float *state, float *scratch, float *kvc, int cached, int cap)
+                          float *state, float *scratch, float *kvc, int cached, int cap,
+                          float *istate)
 {
     const size_t E = (size_t)c->hidden, M = (size_t)c->hc_mult;
     float *xc   = scratch;
@@ -1142,7 +1160,7 @@ void glm53f_decoder_layer(float *h, const Glm53fLayerW *w, const Glm53fCfg *c, i
     hc_site_pre(xc, post, comb, h, &w->attn_hc, c, T, work);
     for (int t = 0; t < T; t++)
         glm53f_rmsnorm(xn + (size_t)t * E, xc + (size_t)t * E, w->in_norm, c->hidden, c->rms_eps);
-    if (w->is_mla) glm53f_mla(y, xn, &w->mla, c, T, sub, kvc, cached, cap);
+    if (w->is_mla) glm53f_mla(y, xn, &w->mla, c, T, sub, kvc, cached, cap, istate);
     else           glm53f_kda_layer(y, xn, &w->kda, c, T, state, sub);
     hc_site_post(h, y, post, comb, c, T, work);
 

@@ -69,7 +69,9 @@ answer. Generation stops at an EOS token from the config (`<|endoftext|>`, `<|us
 | `--out FILE` | JSON report (default `glm53f_run.json`) |
 | `--quiet` | stream the text instead of the per-step table |
 
-Limits: prompt + generated tokens <= 2051 (see ARCHITECTURE.md, MLA); `--gen` <= 8192.
+Limits: prompt + generated tokens <= 32,768 (`--gpu` handles up to 2051, the range where
+dense attention equals the model's sparse attention); `--gen` <= 8192. The KV cache grows
+by 1.44 MB per position, so a 8k session holds ~12 GB of it.
 
 ### Output
 

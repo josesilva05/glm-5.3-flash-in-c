@@ -54,6 +54,7 @@ endif()
 # --------------------------------------------------------------------------- engine --
 add_library(glm53f STATIC
   src/core/glm53f_ops.c
+  src/core/glm53f_dsa.c
   src/io/glm53f_st.c
   src/io/glm53f_load.c
   src/cache/glm53f_cache.c

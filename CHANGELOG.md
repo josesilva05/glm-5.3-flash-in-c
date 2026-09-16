@@ -26,6 +26,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The expert cache is capped by the free physical memory at open time (3 GB of headroom,
   the trunk's RAM counted as free when `--gpu` is requested): asking for more than fits
   used to page the machine to a standstill instead of failing.
+- DeepSeek Sparse Attention (the checkpoint's DSA indexer) is implemented, so sessions are
+  no longer limited to 2051 positions: the indexer picks the 512 best pools of 4 positions
+  plus the tail for every query, exactly as the reference does (new GATE 4 on a 40-position
+  tiny session). `--gpu` still runs dense attention and refuses longer sessions.
 - `--experts int4`: the expert cache can hold routed experts re-quantised to int4
   (group of 64), 1.8x more experts in the same RAM and 13% faster decode, at the cost of an
   approximate output (38 of 40 greedy tokens unchanged). Off by default; the checkpoint on
