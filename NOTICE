@@ -1,0 +1,53 @@
+glm-5.3-flash-in-c
+
+This product includes software licensed under the Apache License, Version 2.0.
+
+Derived from kimi-k3-in-c, Copyright 2026 the kimi-k3-in-c authors, licensed under the
+Apache License, Version 2.0. This attribution is retained as required by section 4(d)
+of that license.
+
+================================================================================
+THIRD-PARTY COMPONENTS
+================================================================================
+
+The following files under third_party/ are vendored from external projects. They remain
+under their original licenses and copyrights, and are licensed to this project under the
+Apache License, Version 2.0.
+
+  third_party/json.h              minimal JSON parser
+  third_party/tok.h               byte-level BPE tokenizer: loader, pre-tokenizers,
+                                  encode and decode
+  third_party/tok_unicode.h       Unicode character-class tables (cl100k)
+  third_party/tok_unicode_o200k.h Unicode character-class tables (o200k)
+
+MODIFICATIONS
+
+  Per section 4(b) of the Apache License, the following changes were made to the
+  vendored files for use in this project:
+
+    tok.h    Added the `rankbpe` flag, which selects tiktoken's lowest-concatenated-id
+             merge rule for vocabularies that ship no merges list; it does not change
+             behaviour when unset. Comments were translated to English and the file
+             header rewritten to describe the file generically.
+
+    json.h   Comments translated to English; header rewritten to state the inputs this
+             project actually parses. No functional change.
+
+    tok_unicode_o200k.h   Header comment corrected to name the regex family. No
+             functional change.
+
+  src/tokenizer/glm53f_tok.h is original work, not vendored. It populates the tok.h
+  structures directly from the checkpoint's tiktoken.model and tokenizer_config.json.
+
+  The Python tools under tools/ drive the transformers library (Apache License 2.0) as
+  the reference implementation; transformers is not vendored or redistributed here.
+
+================================================================================
+MODEL WEIGHTS
+================================================================================
+
+This repository contains no model weights.
+
+GLM-5.3-Flash is released by Z.ai under its own license (MIT, per the model card).
+Obtain the weights from the official distribution and comply with that license; nothing
+here grants any rights to them.

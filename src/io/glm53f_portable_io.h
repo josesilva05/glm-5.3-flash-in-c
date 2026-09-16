@@ -1,0 +1,388 @@
+#include <stdio.h>
+/* glm53f_portable_io.h - shims for the Linux-only I/O calls the readers use.
+ *
+ * The engine asks for things Linux gives it and the other two platforms do not spell
+ * the same way:
+ *
+ *   O_DIRECT       bypass the page cache on expert reads. Darwin's
+ *                  equivalent is not an open() flag but fcntl(F_NOCACHE) after the
+ *                  fact, so O_DIRECT is defined to 0 there (open() is unaffected) and
+ *                  glm53f_set_direct() applies the real thing to the returned descriptor.
+ *                  Windows is the opposite of Darwin: unbuffered I/O (FILE_FLAG_NO_
+ *                  BUFFERING) can ONLY be set at CreateFile time, same constraint as
+ *                  Linux's real O_DIRECT, but nothing in the MinGW runtime maps an
+ *                  open() flag onto it -- so open() itself is intercepted below.
+ *
+ *   posix_fadvise  a page-cache prefetch hint with no Darwin or Windows equivalent.
+ *                  Callers already treat it as advisory -- the one call site returns
+ *                  early on the direct path because the hint has nothing to populate
+ *                  there -- so the shim is a no-op that keeps the buffered path
+ *                  compiling.
+ *
+ *   pread          positioned read. Native on Linux and Darwin. The MinGW runtime has
+ *                  no equivalent, so Windows gets one built on ReadFile's OVERLAPPED
+ *                  Offset/OffsetHigh fields -- a true positioned read that does not
+ *                  touch a shared file-pointer, unlike SetFilePointerEx + ReadFile,
+ *                  which would race when parallel expert-cache
+ *                  prefetch threads pread() the same fd concurrently.
+ *
+ *   posix_memalign Native on Linux and Darwin. Windows gets a thin wrapper over
+ *                  _aligned_malloc, which takes its (size, align) arguments in the
+ *                  opposite order.
+ *
+ * All four call sites fall back to buffered reads (or, for pread/posix_memalign, have
+ * no fallback because the shim IS the implementation) when the direct path is
+ * unavailable, so none of this changes what the engine computes, only how fast it
+ * reads -- except on Windows, where pread and posix_memalign are load-bearing rather
+ * than a speed path, since the codebase has no buffered-only alternative to either.
+ *
+ * A fifth difference is not an open() flag at all: pread() itself returns EINVAL on
+ * Darwin for a single request of 2^31 bytes or more, where Linux either succeeds or
+ * returns a short read that a retry loop already handles. A large tensor read in one
+ * contiguous span can exceed that.
+ * GLM53F_PREAD_MAX is the per-syscall cap every such read loop chunks against; on platforms
+ * without the limit it just turns one syscall into a few, which costs nothing measurable
+ * against a multi-gigabyte transfer.
+ */
+#ifndef GLM53F_PORTABLE_IO_H
+#define GLM53F_PORTABLE_IO_H
+
+/* The readers define _POSIX_C_SOURCE, which hides Darwin's non-standard fcntl commands
+ * (F_NOCACHE among them) from <fcntl.h>. _DARWIN_C_SOURCE puts them back. It must be
+ * set before the first libc header is pulled in, so this header is included first. */
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
+
+#include <fcntl.h>
+#include <stdint.h>
+
+#define GLM53F_PREAD_MAX ((int64_t)1 << 30)   /* 1 GiB per syscall; see file header */
+
+#if defined(__APPLE__)
+
+/* Not an open() flag on Darwin: defining it to 0 leaves open() semantics untouched. */
+#ifndef O_DIRECT
+#define O_DIRECT 0
+#endif
+
+#ifndef POSIX_FADV_WILLNEED
+#define POSIX_FADV_WILLNEED 3
+#endif
+
+static inline int posix_fadvise(int fd, off_t off, off_t len, int advice)
+{
+    (void)fd; (void)off; (void)len; (void)advice;
+    return 0;   /* advisory only; the buffered path is correct without it */
+}
+
+/* Darwin's O_DIRECT equivalent, applied after open(). Failure is not fatal: the caller
+ * keeps the descriptor and reads through the page cache instead. */
+static inline int glm53f_set_direct(int fd)
+{
+    if (fd < 0) return -1;
+    return fcntl(fd, F_NOCACHE, 1);
+}
+
+#elif defined(_WIN32)
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <io.h>
+#include <process.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <BaseTsd.h>
+
+#if defined(_MSC_VER)
+typedef SSIZE_T ssize_t;
+typedef __int64 off_t;
+#endif
+
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 1
+#endif
+#ifndef CLOCK_REALTIME
+#define CLOCK_REALTIME 0
+#endif
+
+#if defined(_MSC_VER)
+static inline int clock_gettime(int clk, struct timespec *ts) {
+    (void)clk;
+    static LARGE_INTEGER freq;
+    static int init = 0;
+    if (!init) { QueryPerformanceFrequency(&freq); init = 1; }
+    LARGE_INTEGER count;
+    QueryPerformanceCounter(&count);
+    ts->tv_sec = (time_t)(count.QuadPart / freq.QuadPart);
+    ts->tv_nsec = (long)(((count.QuadPart % freq.QuadPart) * 1000000000ULL) / freq.QuadPart);
+    return 0;
+}
+#endif
+
+/* Native Windows dirent shim for MSVC */
+#if defined(_WIN32) && !defined(_DIRENT_H)
+#define _DIRENT_H
+typedef struct DIR DIR;
+struct dirent {
+    char d_name[MAX_PATH];
+};
+struct DIR {
+    HANDLE h;
+    WIN32_FIND_DATAA fd;
+    struct dirent de;
+    int first;
+};
+static inline DIR *opendir(const char *path) {
+    char search_path[MAX_PATH];
+    snprintf(search_path, sizeof(search_path), "%s/*", path);
+    DIR *d = (DIR*)malloc(sizeof(DIR));
+    if (!d) return NULL;
+    d->h = FindFirstFileA(search_path, &d->fd);
+    if (d->h == INVALID_HANDLE_VALUE) { free(d); return NULL; }
+    d->first = 1;
+    return d;
+}
+static inline struct dirent *readdir(DIR *d) {
+    if (!d || d->h == INVALID_HANDLE_VALUE) return NULL;
+    if (d->first) {
+        d->first = 0;
+    } else {
+        if (!FindNextFileA(d->h, &d->fd)) return NULL;
+    }
+    strncpy(d->de.d_name, d->fd.cFileName, MAX_PATH);
+    d->de.d_name[MAX_PATH - 1] = '\0';
+    return &d->de;
+}
+static inline int closedir(DIR *d) {
+    if (d) {
+        if (d->h != INVALID_HANDLE_VALUE) FindClose(d->h);
+        free(d);
+    }
+    return 0;
+}
+#endif
+
+/* Native Windows pthreads shim for MSVC */
+#if defined(_MSC_VER) && !defined(_PTHREAD_H)
+#define _PTHREAD_H
+typedef HANDLE pthread_t;
+typedef CRITICAL_SECTION pthread_mutex_t;
+typedef CONDITION_VARIABLE pthread_cond_t;
+
+static inline int pthread_mutex_init(pthread_mutex_t *m, void *attr) { (void)attr; InitializeCriticalSection(m); return 0; }
+static inline int pthread_mutex_destroy(pthread_mutex_t *m) { DeleteCriticalSection(m); return 0; }
+static inline int pthread_mutex_lock(pthread_mutex_t *m) { EnterCriticalSection(m); return 0; }
+static inline int pthread_mutex_unlock(pthread_mutex_t *m) { LeaveCriticalSection(m); return 0; }
+
+static inline int pthread_cond_init(pthread_cond_t *c, void *attr) { (void)attr; InitializeConditionVariable(c); return 0; }
+static inline int pthread_cond_destroy(pthread_cond_t *c) { (void)c; return 0; }
+static inline int pthread_cond_signal(pthread_cond_t *c) { WakeConditionVariable(c); return 0; }
+static inline int pthread_cond_broadcast(pthread_cond_t *c) { WakeAllConditionVariable(c); return 0; }
+static inline int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) { SleepConditionVariableCS(c, m, INFINITE); return 0; }
+
+typedef struct { void *(*fn)(void*); void *arg; } glm53f_win_thread_arg_t;
+static inline unsigned __stdcall glm53f_win_thread_proc(void *p) {
+    glm53f_win_thread_arg_t a = *(glm53f_win_thread_arg_t*)p;
+    free(p);
+    a.fn(a.arg);
+    return 0;
+}
+static inline int pthread_create(pthread_t *t, void *attr, void *(*fn)(void*), void *arg) {
+    (void)attr;
+    glm53f_win_thread_arg_t *a = (glm53f_win_thread_arg_t*)malloc(sizeof(*a));
+    if (!a) return -1;
+    a->fn = fn; a->arg = arg;
+    *t = (HANDLE)_beginthreadex(NULL, 0, glm53f_win_thread_proc, a, 0, NULL);
+    return *t ? 0 : -1;
+}
+static inline int pthread_join(pthread_t t, void **res) {
+    (void)res;
+    WaitForSingleObject(t, INFINITE);
+    CloseHandle(t);
+    return 0;
+}
+#endif
+
+#ifndef O_DIRECT
+#define O_DIRECT 0x40000000   /* sentinel bit; intercepted by glm53f_win_open() below */
+#endif
+
+#ifndef POSIX_FADV_WILLNEED
+#define POSIX_FADV_WILLNEED 3
+#endif
+
+static inline int posix_fadvise(int fd, long long off, long long len, int advice)
+{
+    (void)fd; (void)off; (void)len; (void)advice;
+    return 0;   /* advisory only; no Windows equivalent */
+}
+
+/* True positioned read via ReadFile's OVERLAPPED Offset/OffsetHigh, so no shared
+ * file-pointer state is touched.
+ *
+ * CONCURRENCY. Read-only handles are opened with FILE_FLAG_OVERLAPPED (glm53f_win_open).
+ * On a handle WITHOUT that flag the I/O manager serialises every request on the file
+ * object, so parallel expert reads from the cache's prefetch threads queued behind one
+ * another: measured flat at ~2.4 GB/s from 1 to 32 concurrent reads on a PCIe 4.0 x4
+ * NVMe. With it, requests reach the device together. Each call waits on its own event,
+ * because concurrent operations on one handle must not share the handle's event.
+ * Works on handles opened either way: a synchronous handle simply never pends. */
+static inline long long glm53f_pread(int fd, void *buf, size_t count, long long offset)
+{
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE) { errno = EBADF; return -1; }
+
+    OVERLAPPED ov;
+    memset(&ov, 0, sizeof ov);
+    ov.Offset = (DWORD)(offset & 0xFFFFFFFFu);
+    ov.OffsetHigh = (DWORD)((unsigned long long)offset >> 32);
+    ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!ov.hEvent) { errno = ENOMEM; return -1; }
+
+    DWORD got = 0;
+    long long rc;
+    if (ReadFile(h, buf, (DWORD)count, &got, &ov)) {
+        rc = (long long)got;
+    } else {
+        DWORD err = GetLastError();
+        if (err == ERROR_IO_PENDING) {
+            if (GetOverlappedResult(h, &ov, &got, TRUE)) rc = (long long)got;
+            else { err = GetLastError(); rc = err == ERROR_HANDLE_EOF ? 0 : -1; }
+        } else {
+            rc = err == ERROR_HANDLE_EOF ? 0 : -1;
+        }
+        if (rc < 0) errno = EIO;
+    }
+    CloseHandle(ov.hEvent);
+    return rc;
+}
+#define pread(fd, buf, count, offset) glm53f_pread((fd), (buf), (count), (offset))
+
+/* O_DIRECT has to be intercepted at open() itself: unlike Darwin's post-hoc fcntl,
+ * Windows has no way to add FILE_FLAG_NO_BUFFERING to an already-open handle. The
+ * bridge back to a plain int fd -- so every other pread()/close() call site in the
+ * codebase stays untouched -- goes through _open_osfhandle.
+ *
+ * Every reader call site in this codebase passes O_RDONLY, so the access mode below
+ * matters only to a caller outside the streaming path, such as a test that opens a
+ * fixture file for writing: CreateFileA needs GENERIC_WRITE for that, or a later
+ * ftruncate/write on the resulting handle fails with access denied even though the
+ * open() call itself succeeded. */
+static inline int glm53f_win_open(const char *path, int flags, ...)
+{
+    DWORD fileFlags = FILE_ATTRIBUTE_NORMAL;
+    if (flags & O_DIRECT) fileFlags |= FILE_FLAG_NO_BUFFERING;
+
+    DWORD access = GENERIC_READ;
+    int crtFlags = _O_RDONLY;
+    if ((flags & (O_WRONLY | O_RDWR)) == O_WRONLY) {
+        access = GENERIC_WRITE;
+        crtFlags = _O_WRONLY;
+    } else if (flags & O_RDWR) {
+        access = GENERIC_READ | GENERIC_WRITE;
+        crtFlags = _O_RDWR;
+    } else {
+        /* Read-only handles are only ever read through glm53f_pread, which handles
+         * overlapped completion; see its comment for why this flag matters. */
+        fileFlags |= FILE_FLAG_OVERLAPPED;
+    }
+
+    HANDLE h = CreateFileA(path, access,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            NULL, OPEN_EXISTING, fileFlags, NULL);
+    if (h == INVALID_HANDLE_VALUE) { errno = ENOENT; return -1; }
+
+    int fd = _open_osfhandle((intptr_t)h, crtFlags | _O_BINARY);
+    if (fd < 0) { CloseHandle(h); errno = EMFILE; return -1; }
+    return fd;
+}
+#define open(path, flags, ...) glm53f_win_open((path), (flags))
+
+/* GCC/Clang recognise the name posix_memalign as a built-in for optimisation purposes
+ * (constant folding, alias analysis) even though MinGW's headers declare no such
+ * function and its runtime provides no such symbol -- confirmed directly: a call to
+ * it with no other declaration in scope fails with "implicit declaration", not a
+ * link error, meaning nothing backs the built-in's assumed semantics. This
+ * definition is therefore not optional the way the -Wshadow warning below implies;
+ * it is the only real implementation on this platform. The pragma silences the
+ * warning without silencing -Wshadow project-wide. */
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wshadow"
+#endif
+static inline int posix_memalign(void **out, size_t align, size_t len)
+{
+    *out = _aligned_malloc(len, align);
+    return *out ? 0 : ENOMEM;
+}
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
+/* On real POSIX, a posix_memalign'd pointer is safe to pass to plain free() -- that is
+ * the entire point of the interface. _aligned_malloc has no such guarantee: pairing it
+ * with free() instead of _aligned_free() corrupts the heap (observed directly: Windows
+ * terminates the process with STATUS_HEAP_CORRUPTION). glm53f_aligned_free() exists so the
+ * call site that frees a posix_memalign'd arena (glm53f_cache.c) can free it
+ * correctly on every platform without special-casing Windows at the call site itself. */
+#define glm53f_aligned_free(p) _aligned_free(p)
+
+/* madvise(MADV_HUGEPAGE) is a Linux transparent-hugepage hint; every caller already
+ * treats it as advisory ("failure is not an error"), so a no-op is the
+ * correct port here, not a functional gap. The alternative, VirtualAlloc with
+ * MEM_LARGE_PAGES, needs SeLockMemoryPrivilege and allocations sized to an exact
+ * large-page multiple -- a real feature to build for a hint the code already
+ * tolerates losing. */
+#define madvise(addr, len, advice) ((void)0)
+#define MADV_HUGEPAGE 0
+
+/* O_DIRECT already forced open()-time behavior above; nothing left to do post-open. */
+static inline int glm53f_set_direct(int fd) { (void)fd; return 0; }
+
+#else   /* Linux and friends: O_DIRECT on open() already did it */
+
+static inline int glm53f_set_direct(int fd) { (void)fd; return 0; }
+
+#endif
+
+/* Linux and Darwin: posix_memalign's contract already makes plain free() safe. */
+#ifndef glm53f_aligned_free
+#define glm53f_aligned_free(p) free(p)
+#endif
+
+#if defined(_WIN32) && !defined(ftruncate)
+#define ftruncate(fd, length) _chsize((fd), (long)(length))
+#endif
+
+#if defined(_WIN32) && !defined(lseek)
+#define lseek(fd, offset, origin) _lseeki64((fd), (__int64)(offset), (origin))
+#endif
+
+#if defined(_WIN32)
+#include <direct.h>
+#ifndef rmdir
+#define rmdir(p) _rmdir(p)
+#endif
+#endif
+
+/* Physical memory the process could still take without paging, or 0 when unknown. The
+ * expert cache is sized against this: a cache larger than RAM turns every miss into page
+ * faults and freezes the machine long before it helps. */
+static inline uint64_t glm53f_avail_ram_bytes(void)
+{
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof ms;
+    return GlobalMemoryStatusEx(&ms) ? (uint64_t)ms.ullAvailPhys : 0;
+#elif defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGESIZE)
+    const long pages = sysconf(_SC_AVPHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+    return pages > 0 && page > 0 ? (uint64_t)pages * (uint64_t)page : 0;
+#else
+    return 0;
+#endif
+}
+
+#endif /* GLM53F_PORTABLE_IO_H */
