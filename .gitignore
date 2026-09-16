@@ -12,6 +12,12 @@ compile_commands.json
 *.safetensors
 *.gguf
 
+# Prompts and documents used for local testing: they are the user's content, not the
+# engine's. prompt.txt is the one fixture prompt the docs refer to.
+/documento.txt
+/*_prompt.txt
+/prompts/
+
 # Run artifacts. Anchored to the repository root so that a stray run file in the working
 # directory is ignored while an identically-named fixture is not.
 /*.log
