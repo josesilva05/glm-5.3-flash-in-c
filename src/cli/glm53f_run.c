@@ -104,7 +104,8 @@ static void usage(FILE *f)
 "generation:\n"
 "  --gen N               tokens to generate (default 256)\n"
 "  --no-stop             do not stop at EOS tokens\n"
-"  --cache-gb X          routed-expert cache budget in GB (default 16)\n"
+"  --cache-gb X|auto     routed-expert cache budget in GB. auto (default) takes the\n"
+"                        free RAM, keeping a fifth of the installed RAM for the system\n"
 "  --prefetch N          read each MoE layer's experts and the N most likely experts\n"
 "                        of the next layer (per token) in the background\n"
 "                        (default 6, 0 = off; output is identical either way)\n"
@@ -117,7 +118,7 @@ static void usage(FILE *f)
 "                        same RAM at the cost of an APPROXIMATE output\n"
 "  --gpu                 run the trunk on the CUDA devices (build with -DGLM53F_CUDA=ON);\n"
 "                        routed experts stay on the CPU. The host copy of the trunk\n"
-"                        is freed (~14 GB), so raise --cache-gb accordingly\n"
+"                        is freed (~14 GB), and auto counts it as free\n"
 "\n"
 "diagnostics:\n"
 "  --config PATH         model config (default <model_dir>/config.json)\n"
@@ -155,7 +156,7 @@ int main(int argc, char **argv)
     const char *reasoning = "max";
     int gen = 256, max_layers = -1, raw = 0, no_stop = 0, quiet = 0, prefetch_n = 6, use_gpu = 0;
     int expert_i4 = 0, kv_mode = 0, chat = 0, ctx = 0;
-    double cache_gb = 16.0;
+    double cache_gb = 0.0;                       /* 0: sized from the free RAM */
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
@@ -164,7 +165,14 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--reasoning") && i + 1 < argc) reasoning = argv[++i];
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) gen = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-stop")) no_stop = 1;
-        else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) {
+            const char *v = argv[++i];
+            cache_gb = !strcmp(v, "auto") ? 0.0 : atof(v);
+            if (cache_gb < 0.0 || (cache_gb == 0.0 && strcmp(v, "auto"))) {
+                fprintf(stderr, "--cache-gb takes a size in GB or auto\n");
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--prefetch") && i + 1 < argc) prefetch_n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--gpu")) use_gpu = 1;
         else if (!strcmp(argv[i], "--kv") && i + 1 < argc) {
@@ -231,7 +239,8 @@ int main(int argc, char **argv)
         memset(&s, 0, sizeof s);
         s.m = &cm; s.tok = &ctok; s.dir = dir;
         s.reasoning = !strcmp(reasoning, "low") ? "Low" : !strcmp(reasoning, "high") ? "High" : "Max";
-        s.gen = gen; s.prefetch = prefetch_n; s.on_gpu = on_gpu; s.cache_gb = cache_gb;
+        s.gen = gen; s.prefetch = prefetch_n; s.on_gpu = on_gpu; s.cache_gb = (double)cm.cache.nslot * cm.cache.slot_bytes / 1e9;
+        s.cache_auto = cache_gb <= 0.0;
         s.colour = 1;
         s.load_s = now_s() - t_load;
         printf("\r%*s\r", 24, "");

@@ -19,7 +19,8 @@ typedef struct {
     int          prefetch;
     int          on_gpu;
     int          colour;         /* 0 when the output is not a terminal */
-    double       cache_gb;
+    double       cache_gb;       /* the cache actually allocated */
+    int          cache_auto;     /* 1 when it was sized from the free RAM */
     double       load_s;         /* seconds spent opening the model */
     int          n_mla, n_kda;
 
@@ -28,6 +29,10 @@ typedef struct {
     char        *text;
     int          text_cap;
     float       *logits;
+
+    /* the conversation as Markdown, for /save; owned by the session */
+    char        *log;
+    size_t       log_len, log_cap;
 } Glm53fChat;
 
 int glm53f_chat_run(Glm53fChat *s);

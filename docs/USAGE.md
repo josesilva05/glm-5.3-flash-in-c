@@ -34,7 +34,7 @@ MSBuild can rebuild `glm53f.lib` without relinking the executables.
 ## Run
 
 ```bash
-build/Release/glm53f <model_dir> --prompt-file prompt.txt --gen 400 --cache-gb 24 --quiet
+build/Release/glm53f <model_dir> --prompt-file prompt.txt --gen 400 --gpu --quiet
 ```
 
 The prompt is wrapped in the model's chat template for one user turn:
@@ -58,7 +58,7 @@ answer. Generation stops at an EOS token from the config (`<|endoftext|>`, `<|us
 | `--reasoning max\|high\|low` | the template's Reasoning Effort line (default max) |
 | `--gen N` | tokens to generate (default 256) |
 | `--no-stop` | do not stop at EOS |
-| `--cache-gb X` | routed-expert cache in GB (default 16) |
+| `--cache-gb X\|auto` | routed-expert cache in GB. `auto` (default) takes the RAM free when the model opens, minus what the session needs (attention caches, indexer, work buffers) and a fifth of the installed RAM kept for the system; the size used is printed. With `--gpu` the trunk's RAM counts as free |
 | `--kv auto\|expanded\|compressed` | how the MLA cache stores a position: expanded keys and values (1.44 MB per position) or the `kv_lora` latent (22 KB, expanded once per query, ARCHITECTURE.md 2.7). `auto` (default) uses compressed past 2051 positions, where the expanded cache no longer fits |
 | `--experts fp8\|int4` | `fp8` (default) multiplies the checkpoint's own expert weights. `int4` re-quantises them inside the cache (1.8x more experts in the same RAM, ~13% faster decode) and makes the output an approximation of the model, not the model |
 | `--gpu` | run the trunk (attention, mHC, dense and shared-expert MLPs, lm_head) on all CUDA devices; routed experts stay on the CPU. Needs a `-DGLM53F_CUDA=ON` build. Falls back to the CPU with a message if there is no device or the trunk does not fit. The host copy of the trunk is then freed, so raise `--cache-gb` by ~13 GB (see below) |
@@ -69,11 +69,34 @@ answer. Generation stops at an EOS token from the config (`<|endoftext|>`, `<|us
 | `--dump-logits PATH` | float32 logits of the prompt's last position |
 | `--out FILE` | JSON report (default `glm53f_run.json`) |
 | `--quiet` | stream the text instead of the per-step table |
+| `--chat` | interactive session (below); takes no prompt |
+| `--ctx N` | positions an interactive session may hold (default 2048, 4096 without `--gpu`) |
 
 Limits: prompt + generated tokens <= 32,768 (`--gpu` handles up to 2051, the range where
 dense attention equals the model's sparse attention); `--gen` <= 8192. Past 2051 positions
 the KV cache switches to the compressed form (22 KB per position instead of 1.44 MB), so
 an 8k session holds ~180 MB of it and a 32k session ~0.7 GB.
+
+### Interactive session (`--chat`)
+
+```bash
+build/Release/glm53f <model_dir> --chat --gpu
+```
+
+The model stays loaded between messages, and each turn feeds only its new tokens: what the
+earlier turns left in the KV cache, the KDA state and the indexer is reused, so a follow-up
+question does not re-read the conversation. The reasoning is shown dimmed, the answer after
+a `── resposta ──` separator, and each turn ends with a line of numbers (tokens generated,
+s/token, tokens read, context used, why it stopped).
+
+| command | effect |
+|---|---|
+| `/reset` | forget the conversation and start a new one |
+| `/params` | the settings in force and the context used |
+| `/gen N` | tokens to generate per answer |
+| `/reasoning max\|high\|low` | Reasoning Effort for the next conversation turns |
+| `/save [FILE]` | write the conversation as Markdown: each message, the reasoning in a folded `<details>` block, the answer and its numbers (default `glm53f-chat-YYYYMMDD-HHMMSS.md` in the current directory) |
+| `/help`, `/quit` | |
 
 ### Output
 
@@ -104,6 +127,7 @@ cache report. The JSON report holds prompt ids, generated ids and text, and the 
 | `GLM53F_PREDICT_STATS=1` | report how predictable each layer's routing is |
 | `GLM53F_MTP_STATS=1` | bind the checkpoint's MTP layer, draft a token per decode step and report how often the draft equals the token the model produced (CPU path only; does not change the output) |
 | `GLM53F_CHUNK=N` | positions per prefill chunk (default 256); the output does not depend on it |
+| `GLM53F_SPAN=N` | positions a prefill takes layer by layer at once (default 4096, ARCHITECTURE.md 2.3); the output does not depend on it |
 | `GLM53F_ROUTE_TRACE=path` | append one line per decode MoE layer: layer, the 8 routed experts, microseconds waiting for reads, microseconds computing |
 
 ## GPU environment variables
@@ -119,8 +143,9 @@ cache report. The JSON report holds prompt ids, generated ids and text, and the 
 
 ## Tuning memory
 
-- Give the expert cache the RAM that is left after ~16 GB for the trunk and a few GB for
-  the operating system. More cache means fewer disk reads per token.
+- By default (`--cache-gb auto`) the cache takes what is free when the model opens, keeping
+  a fifth of the installed RAM (12.8 GB on 64 GB) for the system and whatever you open
+  later. Pass a size to choose yourself. More cache means fewer disk reads per token.
 - With `--gpu` only ~1.5 GB of the trunk stays in RAM (embeddings and MoE routers), so the
   cache can take the other ~14 GB: on 64 GB, `--gpu --cache-gb 38` has the same peak RSS
   (~40 GB) as `--cache-gb 24` on the CPU.

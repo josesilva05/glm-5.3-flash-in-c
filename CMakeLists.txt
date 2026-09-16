@@ -120,7 +120,10 @@ endif()
 # The same gates with the prompt fed in chunks of 7 positions: a chunked prefill must
 # leave exactly the state a single pass would, so the results may not move.
 add_test(NAME tiny_oracle_chunked COMMAND test_glm_tiny ${FIX}/glm_tiny)
-set_tests_properties(tiny_oracle_chunked PROPERTIES ENVIRONMENT "GLM53F_CHUNK=7")
+set_tests_properties(tiny_oracle_chunked PROPERTIES ENVIRONMENT "GLM53F_CHUNK=7;GLM53F_GPU_LAYERS_PER_DEV=2")
+# And in spans of 17: a prompt crosses span and chunk boundaries, layer by layer inside a span.
+add_test(NAME tiny_oracle_spans COMMAND test_glm_tiny ${FIX}/glm_tiny)
+set_tests_properties(tiny_oracle_spans PROPERTIES ENVIRONMENT "GLM53F_CHUNK=7;GLM53F_SPAN=17;GLM53F_GPU_LAYERS_PER_DEV=2")
 
 add_test(NAME fp8_kernel COMMAND test_fp8)
 add_test(NAME config_tiny COMMAND test_cfg ${FIX}/glm_tiny/config.json)

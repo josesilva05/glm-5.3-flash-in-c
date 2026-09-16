@@ -89,8 +89,9 @@ static void header(const Glm53fChat *s)
            cc(s, C_CYAN), cc(s, C_RESET), cc(s, C_BOLD), cc(s, C_RESET),
            c->n_layers, s->n_mla, s->n_kda, c->n_experts, c->topk);
     printf("%s│%s %s%s%s\n", cc(s, C_CYAN), cc(s, C_RESET), cc(s, C_GREY), s->dir, cc(s, C_RESET));
-    printf("%s│%s context %d · cache %.0f GB (%d experts) · prefetch %d · %s · kv %s · experts %s\n",
-           cc(s, C_CYAN), cc(s, C_RESET), s->m->cap, s->cache_gb, s->m->cache.nslot, s->prefetch,
+    printf("%s│%s context %d · cache %.1f GB%s (%d experts) · prefetch %d · %s · kv %s · experts %s\n",
+           cc(s, C_CYAN), cc(s, C_RESET), s->m->cap, s->cache_gb, s->cache_auto ? " auto" : "",
+           s->m->cache.nslot, s->prefetch,
            s->on_gpu ? "gpu" : "cpu", s->m->ckv ? "compressed" : "expanded",
            s->m->cache.i4 ? "int4" : "fp8");
     printf("%s│%s %sready in %.1f s · experts stream from disk as they are routed%s\n",
@@ -106,21 +107,93 @@ static void help(const Glm53fChat *s)
            "  /params         the settings in force\n"
            "  /gen N          tokens to generate per answer (now %d)\n"
            "  /reasoning L    max | high | low (now %s)\n"
+           "  /save [FILE]    write the conversation as Markdown (default glm53f-chat-DATE.md)\n"
            "  /quit           leave%s\n\n",
            cc(s, C_GREY), s->gen, s->reasoning, cc(s, C_RESET));
 }
 
 static void params(const Glm53fChat *s)
 {
-    printf("%s  context %d of %d used · cache %.0f GB · prefetch %d · %s · kv %s · experts %s · "
+    printf("%s  context %d of %d used · cache %.1f GB · prefetch %d · %s · kv %s · experts %s · "
            "reasoning %s · gen %d%s\n\n",
            cc(s, C_GREY), s->m->cached, s->m->cap, s->cache_gb, s->prefetch,
            s->on_gpu ? "gpu" : "cpu", s->m->ckv ? "compressed" : "expanded",
            s->m->cache.i4 ? "int4" : "fp8", s->reasoning, s->gen, cc(s, C_RESET));
 }
 
+/* Append to the Markdown transcript; a failed allocation only costs the transcript. */
+static void log_add(Glm53fChat *s, const char *p, size_t n)
+{
+    if (s->log_len + n + 1 > s->log_cap) {
+        size_t cap = s->log_cap ? s->log_cap : 65536;
+        while (s->log_len + n + 1 > cap) cap *= 2;
+        char *g = (char *)realloc(s->log, cap);
+        if (!g) return;
+        s->log = g;
+        s->log_cap = cap;
+    }
+    memcpy(s->log + s->log_len, p, n);
+    s->log_len += n;
+    s->log[s->log_len] = 0;
+}
+
+static void log_str(Glm53fChat *s, const char *p) { log_add(s, p, strlen(p)); }
+
+/* One exchange: the message, the reasoning folded away, the answer. */
+static void log_turn(Glm53fChat *s, const char *msg, const char *out, int len, const char *stats)
+{
+    log_str(s, "## Você\n\n");
+    log_str(s, msg);
+    log_str(s, "\n\n## GLM-5.3-Flash\n\n");
+    const char *close = NULL;
+    for (int i = 0; i + 8 <= len; i++)
+        if (!memcmp(out + i, "</think>", 8)) { close = out + i; break; }
+    const int think = close ? (int)(close - out) : len;
+    if (think > 0) {
+        log_str(s, "<details><summary>Raciocínio</summary>\n\n");
+        log_add(s, out, (size_t)think);
+        log_str(s, "\n\n</details>\n\n");
+    }
+    if (close) log_add(s, close + 8, (size_t)(len - think - 8));
+    else       log_str(s, "*(a resposta não começou antes do limite de tokens)*");
+    log_str(s, "\n\n<sub>");
+    log_str(s, stats);
+    log_str(s, "</sub>\n\n");
+}
+
+static void save(Glm53fChat *s, const char *arg)
+{
+    char name[512];
+    if (arg && *arg) {
+        snprintf(name, sizeof name, "%s", arg);
+    } else {
+        const time_t now = time(NULL);
+        char stamp[32];
+        strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", localtime(&now));
+        snprintf(name, sizeof name, "glm53f-chat-%s.md", stamp);
+    }
+    if (!s->log_len) {
+        printf("%s  nothing to save yet%s\n\n", cc(s, C_GREY), cc(s, C_RESET));
+        return;
+    }
+    FILE *f = fopen(name, "wb");
+    if (!f) {
+        printf("%s  cannot write %s%s\n\n", cc(s, C_GREY), name, cc(s, C_RESET));
+        return;
+    }
+    fprintf(f, "# Conversa com GLM-5.3-Flash\n\n<sub>glm53f · reasoning %s · %s · kv %s · experts %s</sub>\n\n",
+            s->reasoning, s->on_gpu ? "gpu" : "cpu", s->m->ckv ? "compressed" : "expanded",
+            s->m->cache.i4 ? "int4 (approximate)" : "fp8");
+    const int ok = fwrite(s->log, 1, s->log_len, f) == s->log_len;
+    if (fclose(f) != 0 || !ok) {
+        printf("%s  writing %s failed%s\n\n", cc(s, C_GREY), name, cc(s, C_RESET));
+        return;
+    }
+    printf("%s  saved %s%s\n\n", cc(s, C_GREY), name, cc(s, C_RESET));
+}
+
 /* Feed `text`, then generate until EOS or `gen` tokens, streaming what is decodable. */
-static int turn(Glm53fChat *s, const char *text)
+static int turn(Glm53fChat *s, const char *text, const char *msg)
 {
     Glm53fModel *m = s->m;
     const Glm53fCfg *c = &m->cfg;
@@ -174,9 +247,15 @@ static int turn(Glm53fChat *s, const char *text)
     }
     const double t_dec = now_s() - td;
     if (in_think) printf("%s", cc(s, C_RESET));
-    printf("\n\n%s  %d tokens em %.1f s (%.2f s/token) · leitura %d em %.1f s · contexto %d/%d%s%s\n\n",
-           cc(s, C_GREY), nout, t_dec, nout ? t_dec / nout : 0.0, n, t_prefill,
-           m->cached, m->cap, stopped ? " · parou no EOS" : " · limite de --gen", cc(s, C_RESET));
+    char stats[256];
+    snprintf(stats, sizeof stats, "%d tokens em %.1f s (%.2f s/token) · leitura %d em %.1f s · contexto %d/%d%s",
+             nout, t_dec, nout ? t_dec / nout : 0.0, n, t_prefill, m->cached, m->cap,
+             stopped ? " · parou no EOS" : " · limite de --gen");
+    printf("\n\n%s  %s%s\n\n", cc(s, C_GREY), stats, cc(s, C_RESET));
+    int len = nout ? tok_decode(s->tok, s->out, nout, s->text, s->text_cap - 1) : 0;
+    if (len < 0) len = 0;
+    s->text[len] = 0;
+    log_turn(s, msg, s->text, len, stats);
     return 0;
 }
 
@@ -210,7 +289,12 @@ int glm53f_chat_run(Glm53fChat *s)
             if (!strcmp(line, "/reset")) {
                 glm53f_model_reset(s->m);
                 first = 1;
+                s->log_len = 0;                  /* a new conversation, a new transcript */
                 printf("%s  conversation cleared%s\n\n", cc(s, C_GREY), cc(s, C_RESET));
+                continue;
+            }
+            if (!strcmp(line, "/save") || !strncmp(line, "/save ", 6)) {
+                save(s, line[5] ? line + 6 : NULL);
                 continue;
             }
             if (!strncmp(line, "/gen ", 5)) {
@@ -238,10 +322,12 @@ int glm53f_chat_run(Glm53fChat *s)
             snprintf(text, 65536 + 256, "<|user|>%s<|assistant|><think>", line);
         first = 0;
         printf("\n");
-        if (turn(s, text) != 0) { free(line); free(text); return 1; }
+        if (turn(s, text, line) != 0) { free(line); free(text); free(s->log); s->log = NULL; return 1; }
     }
     free(line);
     free(text);
+    free(s->log);
+    s->log = NULL;
     printf("%s  bye%s\n", cc(s, C_GREY), cc(s, C_RESET));
     return 0;
 }

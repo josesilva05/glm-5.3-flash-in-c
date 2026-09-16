@@ -385,4 +385,19 @@ static inline uint64_t glm53f_avail_ram_bytes(void)
 #endif
 }
 
+/* Physical memory installed, or 0 when the platform does not say. */
+static inline uint64_t glm53f_total_ram_bytes(void)
+{
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof ms;
+    return GlobalMemoryStatusEx(&ms) ? (uint64_t)ms.ullTotalPhys : 0;
+#elif defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+    const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+    return pages > 0 && page > 0 ? (uint64_t)pages * (uint64_t)page : 0;
+#else
+    return 0;
+#endif
+}
+
 #endif /* GLM53F_PORTABLE_IO_H */

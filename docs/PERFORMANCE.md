@@ -110,6 +110,36 @@ Prefill with prefetch (`--gen 1`, 24 GB cache; logits bit-identical in every run
 
 Prefill is 33% faster with the default; ~97% of the experts read ahead are used.
 
+### Layer by layer (a 372-token document)
+
+A prompt is fed in chunks of 256 positions. Taken chunk by chunk through all 45 layers,
+every chunk routes to nearly all 288 experts of every layer, and by the time the next chunk
+reaches a layer the cache has moved on to the layers after it: the 372-token prompt read
+431 GB of experts, more than the 305 GB the model has. Taken layer by layer (ARCHITECTURE.md
+2.3), a layer's experts are read once for the whole prompt.
+
+`--gpu --cache-gb 16`, `--gen 1`, interleaved runs, the same prompt; logits of the last
+position byte-identical between the two:
+
+| order | prefill (3 runs) | experts read | of which on demand |
+|---|---|---|---|
+| chunk by chunk (before) | 196.1, 191.0, 192.2 s | 431 GB | 39 GB |
+| **layer by layer** | **118.6, 119.0, 120.1 s** | **257 GB** | 4 GB |
+
+38% faster. The gain grows with the prompt: chunk by chunk the reads grow with the number of
+chunks, layer by layer they are bounded by the experts the prompt actually uses.
+
+With the first 6 layers only (`--layers 6`, 3 MoE layers) the same prompt read 46 GB before
+and 21.7 GB after, and showed the one thing layer-major ordering changes for prefetch: with an
+8 GB cache (one layer of experts) hinting the next layer's predicted experts evicted experts
+the current layer still needed, and the reads stayed at 43 GB. A prefill therefore predicts
+the next layer only when the cache holds two layers' experts (576 slots, 14.5 GB).
+
+| `--layers 6 --gpu` | 8 GB cache | 16 GB cache |
+|---|---|---|
+| chunk by chunk | 20.5 s, 46.2 GB | 18.1 s, 40.4 GB |
+| layer by layer | 14.2 s, 21.7 GB | 11.7 s, 21.7 GB |
+
 ## CUDA backend (`--gpu`)
 
 The trunk runs on the two GPUs, routed experts on the CPU (ARCHITECTURE.md 2.6). 40
