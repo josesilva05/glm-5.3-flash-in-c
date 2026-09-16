@@ -225,7 +225,36 @@ Validation: `test_glm_tiny` GATE 4 runs a 40-position session on the tiny model,
 at all 40 positions. `--gpu` keeps its dense kernels, so it refuses sessions longer than
 the dense-equivalent range and leaves the trunk on the CPU.
 
-### 2.7 CUDA backend (`--gpu`)
+### 2.7 KV cache: expanded or compressed (`--kv`)
+
+MLA compresses a position into a `kv_lora` latent of 512 floats and expands it into 64
+heads of keys and values through `kv_b`. The cache can hold either form:
+
+| form | per position | how attention runs |
+|---|---|---|
+| expanded (`--kv expanded`) | 1.44 MB over the 11 MLA layers | scores against stored keys, sums stored values |
+| compressed (`--kv compressed`) | 22 KB, 64x less | folds `kv_b` into the query and the output |
+
+The compressed form uses the identity that makes MLA cheap:
+
+```
+q . (W_k c)         = (W_k^T q) . c            score against the latent itself
+sum_j p_j (W_v c_j) = W_v (sum_j p_j c_j)      expand once per query, not per key
+```
+
+so `kv_b` is applied twice per query and head (once to the query, once to the weighted sum
+of latents) instead of once per stored position. Per attended position the attention does
+2 x kv_lora multiply-adds instead of qk_nope + v_head, which is twice the work, and the
+cache stops being what limits a long session: 32,768 positions cost 0.72 GB instead of
+47 GB. Exact arithmetic gives the same value; in floating point the order of the sums
+differs, and on the released checkpoint the two forms land 7.6e-06 apart, against a
+distance of 1.5e-05 from the reference itself.
+
+`--kv auto`, the default, picks compressed only past the dense-attention range (2051
+positions), where the expanded cache would not fit anyway. `--gpu` expands on the device
+and takes the expanded form.
+
+### 2.8 CUDA backend (`--gpu`)
 
 Built with `-DGLM53F_CUDA=ON`. The trunk moves to the GPUs; routed experts stay where the
 bytes are, on the CPU with the cache and prefetch of 2.4-2.5.
@@ -271,7 +300,7 @@ Validation: `test_glm_tiny` GATE G1-G3 repeat the reference checks with the trun
 GPU and layers split across devices; on the real checkpoint the 45-layer logits stay within
 2.1e-5 of the reference and 40 greedy tokens match the CPU run (VALIDATION.md 2.2).
 
-### 2.8 MTP layer (multi-token prediction)
+### 2.9 MTP layer (multi-token prediction)
 
 `GLM53F_MTP_STATS=1` binds checkpoint layer `n_layers` ("nextn"), which the released
 transformers does not implement (it skips `layers.45.`). From the hidden state of position
@@ -292,7 +321,7 @@ reference implementation safe to run. Today the engine only measures it (88.6% o
 match; see PERFORMANCE.md for why speculation is not worth it on this machine). The layer
 needs the lm_head on the host, so it is unavailable together with `--gpu`.
 
-### 2.9 Failure policy
+### 2.10 Failure policy
 
 A wrong model that prints fluent text is the failure this engine is built to avoid:
 

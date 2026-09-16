@@ -47,6 +47,7 @@ python -c "import numpy as np; r=np.fromfile('ref/logits.bin','f4'); c=np.fromfi
 | all 45 layers, same prompt | same next token (785, "The") and identical top-10; max difference 1.5e-5 (7e-7 relative) |
 | decode: prompt + 5 generated tokens fed to the reference | reference predicts the engine's 6th token (41949) |
 | full generation, 234 tokens | coherent reasoning and the correct answer ("A capital do Brasil é Brasília..."), stopped at EOS |
+| `--kv compressed`, all 45 layers, same prompt | same next token and top-10; 1.5e-5 from the reference, 7.6e-06 from the expanded cache; the tiny oracle passes every gate in this mode, including the 40-position sparse one |
 | `--gpu`, all 45 layers, same prompt | same next token and top-10; max difference 2.1e-5 from the reference, 1.2e-5 from the CPU engine |
 | `--gpu`, 40 greedy tokens (12 runs: 24/38/44 GB caches, keep-warm on and off) | generated ids identical to the CPU run |
 | `--experts int4`, 40 greedy tokens | 38 of 40 tokens equal to the exact run, same next-token argmax; logits RMS 0.77 from the exact path. This mode is an approximation by construction and is off by default |

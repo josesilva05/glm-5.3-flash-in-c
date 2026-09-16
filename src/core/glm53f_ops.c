@@ -688,6 +688,54 @@ void glm53f_kda_layer(float *out, const float *x, const Glm53fKdaW *w, const Glm
  * The EXPANDED per-head keys and values are cached: re-expanding a 512-float latent
  * through kv_b at every position of every step would cost far more than the memory.
  */
+/* ---- compressed KV (MLA absorption) ----
+ * The cache can hold the 512-float latent per position instead of the expanded keys and
+ * values (32,768 floats), 64x less memory, by folding kv_b into the query and the output:
+ *
+ *   q . (W_k c)            = (W_k^T q) . c           scores against the latent
+ *   sum_j p_j (W_v c_j)    = W_v (sum_j p_j c_j)     one expansion per query, not per key
+ *
+ * Same value in exact arithmetic, a different order of sums in floating point.
+ */
+
+/* A row slice [r0, r0+n) of a matrix, as a matrix. FP8 slices must start on a scale-block
+ * row, which holds here: kv_b rows are sliced at multiples of qk_nope + v_head and of
+ * qk_nope, both multiples of the block height in the released checkpoint. */
+static Glm53fMat row_slice(const Glm53fMat *m, int r0, int n)
+{
+    Glm53fMat s = *m;
+    s.rows = n;
+    if (m->dt == GLM53F_WBF16)      s.w = (const uint16_t *)m->w + (size_t)r0 * m->cols;
+    else if (m->dt == GLM53F_WF8) { s.w = (const unsigned char *)m->w + (size_t)r0 * m->cols;
+                                    s.s = m->s + (size_t)(r0 / m->br) * m->scols; }
+    else                            s.w = (const float *)m->w + (size_t)r0 * m->cols;
+    return s;
+}
+
+/* y[c] = sum_i x[i] * M[r0+i][c], the transpose of a row slice applied to x. */
+static void matmul_transposed(double *y, const float *x, const Glm53fMat *m, int r0, int n)
+{
+    const int C = m->cols;
+    for (int c = 0; c < C; c++) y[c] = 0.0;
+    for (int i = 0; i < n; i++) {
+        const double xi = (double)x[i];
+        if (xi == 0.0) continue;
+        const int r = r0 + i;
+        if (m->dt == GLM53F_WBF16) {
+            const uint16_t *row = (const uint16_t *)m->w + (size_t)r * C;
+            for (int c = 0; c < C; c++) y[c] += xi * (double)glm53f_bf16f(row[c]);
+        } else if (m->dt == GLM53F_WF8) {
+            const unsigned char *row = (const unsigned char *)m->w + (size_t)r * C;
+            const float *srow = m->s + (size_t)(r / m->br) * m->scols;
+            for (int c = 0; c < C; c++)
+                y[c] += xi * (double)GLM53F_E4M3[row[c]] * (double)srow[c / m->bc];
+        } else {
+            const float *row = (const float *)m->w + (size_t)r * C;
+            for (int c = 0; c < C; c++) y[c] += xi * (double)row[c];
+        }
+    }
+}
+
 size_t glm53f_mla_scratch(const Glm53fCfg *c, int T, int cap)
 {
     const size_t H = (size_t)c->n_heads;
@@ -696,11 +744,13 @@ size_t glm53f_mla_scratch(const Glm53fCfg *c, int T, int cap)
          + (size_t)T * H * c->v_head       /* attention output              */
          + H * (size_t)(cap > T ? cap : T) /* per-head score rows           */
          + glm53f_dsa_scratch(c, cap)      /* indexer                       */
-         + (size_t)(c->index_topk + c->index_kpool);   /* selected positions */
+         + (size_t)(c->index_topk + c->index_kpool)    /* selected positions */
+         + 4 * (size_t)c->kv_lora * H;     /* absorbed query and latent sum, per head (double) */
 }
 
 void glm53f_mla(float *out, const float *x, const Glm53fMlaW *w, const Glm53fCfg *c,
-                int T, float *scratch, float *kvc, int cached, int cap, float *istate)
+                int T, float *scratch, float *kvc, int cached, int cap, float *istate,
+                float *ckv)
 {
     const int E = c->hidden, H = c->n_heads, qn = c->qk_nope, vh = c->v_head;
     const int kvd = qn + vh;
@@ -724,7 +774,8 @@ void glm53f_mla(float *out, const float *x, const Glm53fMlaW *w, const Glm53fCfg
         glm53f_mm(q + (size_t)t * H * qn, qlt, &w->q_b);
         glm53f_mm(ct, xt, &w->kv_a);
         glm53f_rmsnorm(ct, ct, w->kv_a_norm, c->kv_lora, c->rms_eps);
-        glm53f_mm(kvc + (size_t)(cached + t) * H * kvd, ct, &w->kv_b);
+        if (ckv) memcpy(ckv + (size_t)(cached + t) * c->kv_lora, ct, (size_t)c->kv_lora * sizeof(float));
+        else     glm53f_mm(kvc + (size_t)(cached + t) * H * kvd, ct, &w->kv_b);
     }
 
     /* The indexer sees every position, including the ones this call appends. */
@@ -748,6 +799,39 @@ void glm53f_mla(float *out, const float *x, const Glm53fMlaW *w, const Glm53fCfg
             const float *qt = q + ((size_t)t * H + h) * qn;
             float *s = sc + (size_t)h * nb;
             double m = -INFINITY;
+            if (ckv) {                                   /* absorbed: score against latents */
+                const int KL = c->kv_lora;
+                /* one pair of double buffers per head: the head loop runs in parallel */
+                double *qa = (double *)(void *)(sel + c->index_topk + c->index_kpool) +
+                             (size_t)h * 2 * KL;
+                double *cb = qa + KL;
+                matmul_transposed(qa, qt, &w->kv_b, h * kvd, qn);
+                for (int jj = 0; jj < nvis; jj++) {
+                    const int j = nsel < 0 ? jj : sel[jj];
+                    const float *cj = ckv + (size_t)j * KL;
+                    double d = 0.0;
+                    for (int i = 0; i < KL; i++) d += qa[i] * (double)cj[i];
+                    d *= scale;
+                    s[jj] = (float)d;
+                    if (d > m) m = d;
+                }
+                double z = 0.0;
+                for (int jj = 0; jj < nvis; jj++) z += exp((double)s[jj] - m);
+                for (int i = 0; i < KL; i++) cb[i] = 0.0;
+                for (int jj = 0; jj < nvis; jj++) {
+                    const int j = nsel < 0 ? jj : sel[jj];
+                    const double pr = exp((double)s[jj] - m) / z;
+                    const float *cj = ckv + (size_t)j * KL;
+                    for (int i = 0; i < KL; i++) cb[i] += pr * (double)cj[i];
+                }
+                float *o = acc + ((size_t)t * H + h) * vh;
+                float cbf[1024];
+                if (KL > 1024) glm53f_fatal_bound("MLA latent width", KL, 1024);
+                for (int i = 0; i < KL; i++) cbf[i] = (float)cb[i];
+                const Glm53fMat wv = row_slice(&w->kv_b, h * kvd + qn, vh);
+                glm53f_mm(o, cbf, &wv);
+                continue;
+            }
             for (int jj = 0; jj < nvis; jj++) {
                 const int j = nsel < 0 ? jj : sel[jj];
                 const float *kj = kvc + ((size_t)j * H + h) * kvd;
@@ -1145,7 +1229,7 @@ static void hc_site_post(float *h, const float *y, const float *post, const floa
 
 void glm53f_decoder_layer(float *h, const Glm53fLayerW *w, const Glm53fCfg *c, int T,
                           float *state, float *scratch, float *kvc, int cached, int cap,
-                          float *istate)
+                          float *istate, float *ckv)
 {
     const size_t E = (size_t)c->hidden, M = (size_t)c->hc_mult;
     float *xc   = scratch;
@@ -1160,7 +1244,7 @@ void glm53f_decoder_layer(float *h, const Glm53fLayerW *w, const Glm53fCfg *c, i
     hc_site_pre(xc, post, comb, h, &w->attn_hc, c, T, work);
     for (int t = 0; t < T; t++)
         glm53f_rmsnorm(xn + (size_t)t * E, xc + (size_t)t * E, w->in_norm, c->hidden, c->rms_eps);
-    if (w->is_mla) glm53f_mla(y, xn, &w->mla, c, T, sub, kvc, cached, cap, istate);
+    if (w->is_mla) glm53f_mla(y, xn, &w->mla, c, T, sub, kvc, cached, cap, istate, ckv);
     else           glm53f_kda_layer(y, xn, &w->kda, c, T, state, sub);
     hc_site_post(h, y, post, comb, c, T, work);
 

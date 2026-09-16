@@ -48,7 +48,8 @@ same peak RSS (`--cache-gb 38`), with the same generated tokens; see
 
 - **mHC** residual: 4 streams; per sub-block, learned collapse weights and a Sinkhorn-normalised 4x4 mixer.
 - **KDA** (34 layers): gated delta rule with per-channel decay, short conv, low-rank output gate.
-- **MLA** (11 layers): NoPE, no output gate, with the model's **DeepSeek Sparse Attention**:
+- **MLA** (11 layers): NoPE, no output gate, a KV cache that can hold the compressed latent
+  (22 KB per position instead of 1.44 MB), with the model's **DeepSeek Sparse Attention**:
   the indexer scores pools of 4 positions and keeps the 2048 best plus the tail, so a query
   attends to at most 2051 positions of any context. Up to 2051 positions that selection is
   everything, and the engine runs the dense path it always did.

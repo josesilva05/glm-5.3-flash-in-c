@@ -278,8 +278,12 @@ void   glm53f_kda_layer(float *out, const float *x, const Glm53fKdaW *w, const G
 /* MLA (dense causal, NoPE). kvc is [cap][n_heads*(qk_nope+v_head)]; cached positions are
  * attended over and this call's T positions are appended at [cached, cached+T). */
 size_t glm53f_mla_scratch(const Glm53fCfg *c, int T, int cap);
+/* kvc holds the expanded keys and values; pass ckv instead (kvc NULL) to keep only the
+ * kv_lora latent per position, 64x less memory, with kv_b folded into the query and the
+ * output. Exactly the same value, a different order of floating-point sums. */
 void   glm53f_mla(float *out, const float *x, const Glm53fMlaW *w, const Glm53fCfg *c,
-                  int T, float *scratch, float *kvc, int cached, int cap, float *istate);
+                  int T, float *scratch, float *kvc, int cached, int cap, float *istate,
+                  float *ckv);
 
 /* ---- DSA indexer (glm53f_dsa.c) ----
  * State per MLA layer: glm53f_dsa_state_floats(c, cap). Append the T new positions before
@@ -319,7 +323,7 @@ void   glm53f_mlp(float *out, const float *x, const Glm53fMat *gate, const Glm53
 size_t glm53f_layer_scratch(const Glm53fCfg *c, int T, int cap);
 void   glm53f_decoder_layer(float *h, const Glm53fLayerW *w, const Glm53fCfg *c, int T,
                             float *state, float *scratch, float *kvc, int cached, int cap,
-                            float *istate);
+                            float *istate, float *ckv);
 
 /* Recurrent + conv state floats for one KDA layer. */
 static inline size_t glm53f_kda_state_floats(const Glm53fCfg *c)

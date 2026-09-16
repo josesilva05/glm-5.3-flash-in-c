@@ -59,6 +59,7 @@ answer. Generation stops at an EOS token from the config (`<|endoftext|>`, `<|us
 | `--gen N` | tokens to generate (default 256) |
 | `--no-stop` | do not stop at EOS |
 | `--cache-gb X` | routed-expert cache in GB (default 16) |
+| `--kv auto\|expanded\|compressed` | how the MLA cache stores a position: expanded keys and values (1.44 MB per position) or the `kv_lora` latent (22 KB, expanded once per query, ARCHITECTURE.md 2.7). `auto` (default) uses compressed past 2051 positions, where the expanded cache no longer fits |
 | `--experts fp8\|int4` | `fp8` (default) multiplies the checkpoint's own expert weights. `int4` re-quantises them inside the cache (1.8x more experts in the same RAM, ~13% faster decode) and makes the output an approximation of the model, not the model |
 | `--gpu` | run the trunk (attention, mHC, dense and shared-expert MLPs, lm_head) on all CUDA devices; routed experts stay on the CPU. Needs a `-DGLM53F_CUDA=ON` build. Falls back to the CPU with a message if there is no device or the trunk does not fit. The host copy of the trunk is then freed, so raise `--cache-gb` by ~13 GB (see below) |
 | `--prefetch N` | predictive expert prefetch in prefill and decode: background readers fetch each MoE layer's experts and the N most likely experts of the next layer (per token) while compute continues (default 6, `0` = off; output is identical either way). `GLM53F_IO_THREADS` sets the reader count (default 2). With `--gpu`, where compute is faster, `--prefetch 4` measured marginally better (PERFORMANCE.md) |
@@ -70,8 +71,9 @@ answer. Generation stops at an EOS token from the config (`<|endoftext|>`, `<|us
 | `--quiet` | stream the text instead of the per-step table |
 
 Limits: prompt + generated tokens <= 32,768 (`--gpu` handles up to 2051, the range where
-dense attention equals the model's sparse attention); `--gen` <= 8192. The KV cache grows
-by 1.44 MB per position, so a 8k session holds ~12 GB of it.
+dense attention equals the model's sparse attention); `--gen` <= 8192. Past 2051 positions
+the KV cache switches to the compressed form (22 KB per position instead of 1.44 MB), so
+an 8k session holds ~180 MB of it and a 32k session ~0.7 GB.
 
 ### Output
 

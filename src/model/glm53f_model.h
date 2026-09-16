@@ -27,6 +27,7 @@ typedef struct Glm53fModel {
     float           *state;          /* [n_bound][kda_state_floats]  */
     float          **kv;             /* [n_bound] -> [cap][H*(qk_nope+v_head)], NULL on KDA layers */
     float          **idx;            /* [n_bound] -> DSA indexer state, NULL on KDA layers   */
+    float          **ckv;            /* [n_bound] -> compressed KV ([cap][kv_lora]), or NULL */
 
     int              layers_completed;
     double           load_seconds;
@@ -46,9 +47,12 @@ typedef struct Glm53fModel {
  * them in the same RAM, see glm53f.h GLM53F_WI4). The output is then an approximation of
  * the checkpoint, not the checkpoint; it is off by default. */
 /* gpu_planned != 0: the caller intends to call glm53f_model_use_gpu, which frees the host
- * copy of the trunk; the expert cache may then use that RAM too. */
+ * copy of the trunk; the expert cache may then use that RAM too.
+ * kv: 0 chooses (compressed past the dense-attention range, expanded below it), 1 forces
+ * the expanded keys and values, 2 forces the kv_lora latent (64x less memory). */
 int  glm53f_model_open(Glm53fModel *m, const char *dir, const char *cfg_path, double cache_gb,
-                       int max_layers, int cap, int prefetch_n, int expert_i4, int gpu_planned);
+                       int max_layers, int cap, int prefetch_n, int expert_i4, int gpu_planned,
+                       int kv);
 void glm53f_model_close(Glm53fModel *m);
 
 /* Forget every carried position. */

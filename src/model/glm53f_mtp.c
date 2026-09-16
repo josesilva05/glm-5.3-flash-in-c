@@ -11,6 +11,7 @@ struct Glm53fMtp {
     Glm53fMtpBind b;
     float *kv;                 /* [cap][n_heads*(qk_nope+v_head)] */
     float *istate;             /* DSA indexer state of the MTP layer */
+    float *ckv;                /* compressed KV when the model uses it */
     int    cap, cached, maxT;
     float *x, *cat, *y, *lg;   /* [maxT][hidden], [maxT][2*hidden], [maxT][hidden], [vocab] */
     float *scratch;
@@ -55,13 +56,20 @@ int glm53f_mtp_open(Glm53fModel *m, int cap)
     const size_t E = (size_t)c->hidden;
     t->kv = (float *)malloc((size_t)cap * glm53f_kv_floats_per_pos(c) * sizeof(float));
     t->istate = (float *)calloc(glm53f_dsa_state_floats(c, cap), sizeof(float));
+    if (m->ckv) {                       /* follow the model's choice of KV cache */
+        free(t->kv);
+        t->kv = NULL;
+        t->ckv = (float *)calloc((size_t)cap * c->kv_lora, sizeof(float));
+        if (!t->ckv) { glm53f_bind_mtp_free(&t->b); free(t->istate); free(t); return -1; }
+    }
     t->x = (float *)malloc((size_t)t->maxT * E * sizeof(float));
     t->y = (float *)malloc((size_t)t->maxT * E * sizeof(float));
     t->cat = (float *)malloc((size_t)t->maxT * 2 * E * sizeof(float));
     t->lg = (float *)malloc((size_t)c->vocab * sizeof(float));
     t->scratch = (float *)malloc(work_floats(c, t->maxT, cap) * sizeof(float));
     m->mtp_h = (float *)malloc((size_t)cap * E * sizeof(float));
-    if (!t->kv || !t->istate || !t->x || !t->y || !t->cat || !t->lg || !t->scratch || !m->mtp_h) {
+    if ((!t->kv && !t->ckv) || !t->istate || !t->x || !t->y || !t->cat || !t->lg ||
+        !t->scratch || !m->mtp_h) {
         glm53f_bind_mtp_free(&t->b);
         free(t->kv); free(t->x); free(t->y); free(t->cat); free(t->lg); free(t->scratch);
         free(t);
@@ -78,7 +86,7 @@ void glm53f_mtp_close(Glm53fModel *m)
     Glm53fMtp *t = m->mtp;
     if (!t) return;
     glm53f_bind_mtp_free(&t->b);
-    free(t->kv); free(t->istate); free(t->x); free(t->y); free(t->cat); free(t->lg);
+    free(t->kv); free(t->ckv); free(t->istate); free(t->x); free(t->y); free(t->cat); free(t->lg);
     free(t->scratch);
     free(t);
     m->mtp = NULL;
@@ -112,7 +120,8 @@ int glm53f_mtp_feed(Glm53fModel *m, const float *h, const int *next_ids, int T, 
     const long drops = glm53f_expert_drops;
     for (int i = 0; i < T; i++)
         glm53f_rmsnorm(t->y + (size_t)i * E, t->x + (size_t)i * E, w->w.in_norm, E, c->rms_eps);
-    glm53f_mla(t->cat, t->y, &w->w.mla, c, T, t->scratch, t->kv, t->cached, t->cap, t->istate);
+    glm53f_mla(t->cat, t->y, &w->w.mla, c, T, t->scratch, t->kv, t->cached, t->cap, t->istate,
+               t->ckv);
     for (size_t i = 0; i < (size_t)T * E; i++) t->x[i] += t->cat[i];
 
     for (int i = 0; i < T; i++)

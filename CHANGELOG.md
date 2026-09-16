@@ -26,6 +26,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The expert cache is capped by the free physical memory at open time (3 GB of headroom,
   the trunk's RAM counted as free when `--gpu` is requested): asking for more than fits
   used to page the machine to a standstill instead of failing.
+- `--kv compressed`: the MLA cache can hold the `kv_lora` latent per position (22 KB)
+  instead of the expanded keys and values (1.44 MB), by folding `kv_b` into the query and
+  the output. 64x less memory, the same value to 7.6e-06, chosen automatically past 2051
+  positions, where a 32k session now needs 0.72 GB of cache instead of 47 GB.
 - DeepSeek Sparse Attention (the checkpoint's DSA indexer) is implemented, so sessions are
   no longer limited to 2051 positions: the indexer picks the 512 best pools of 4 positions
   plus the tail for every query, exactly as the reference does (new GATE 4 on a 40-position

@@ -107,6 +107,10 @@ static void usage(FILE *f)
 "  --prefetch N          read each MoE layer's experts and the N most likely experts\n"
 "                        of the next layer (per token) in the background\n"
 "                        (default 6, 0 = off; output is identical either way)\n"
+"  --kv auto|expanded|compressed\n"
+"                        how the MLA cache stores a position: expanded keys and values\n"
+"                        (1.44 MB) or the kv_lora latent (22 KB, expanded per query).\n"
+"                        auto (default) picks compressed past 2051 positions\n"
 "  --experts fp8|int4    fp8 (default) streams the checkpoint own expert weights; int4\n"
 "                        re-quantises them in the cache, fitting 1.8x more experts in the\n"
 "                        same RAM at the cost of an APPROXIMATE output\n"
@@ -145,7 +149,7 @@ int main(int argc, char **argv)
     const char *cfg_path = NULL, *logits_path = NULL, *outp = "glm53f_run.json";
     const char *reasoning = "max";
     int gen = 256, max_layers = -1, raw = 0, no_stop = 0, quiet = 0, prefetch_n = 6, use_gpu = 0;
-    int expert_i4 = 0;
+    int expert_i4 = 0, kv_mode = 0;
     double cache_gb = 16.0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
@@ -158,6 +162,13 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--prefetch") && i + 1 < argc) prefetch_n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--gpu")) use_gpu = 1;
+        else if (!strcmp(argv[i], "--kv") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "expanded")) kv_mode = 1;
+            else if (!strcmp(v, "compressed")) kv_mode = 2;
+            else if (!strcmp(v, "auto")) kv_mode = 0;
+            else { fprintf(stderr, "--kv must be auto, expanded or compressed\n"); return 2; }
+        }
         else if (!strcmp(argv[i], "--experts") && i + 1 < argc) {
             const char *v = argv[++i];
             if (!strcmp(v, "int4")) expert_i4 = 1;
@@ -232,7 +243,7 @@ int main(int argc, char **argv)
         return 2;
     }
     if (glm53f_model_open(&m, dir, cfg_path, cache_gb, max_layers, cap, prefetch_n, expert_i4,
-                          use_gpu) != 0)
+                          use_gpu, kv_mode) != 0)
         return 1;
     if (expert_i4)
         printf("NOTE: --experts int4 re-quantises routed experts in the cache: 1.8x more of them\n"

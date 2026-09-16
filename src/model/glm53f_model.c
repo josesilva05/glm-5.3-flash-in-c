@@ -26,6 +26,13 @@ size_t glm53f_model_state_bytes(const Glm53fModel *m)
     return glm53f_kda_state_floats(&m->cfg) * (size_t)m->n_bound * sizeof(float);
 }
 
+static int n_mla_layers(const Glm53fCfg *c)
+{
+    int n = 0;
+    for (int L = 0; L < c->n_layers; L++) n += glm53f_is_mla(c, L);
+    return n;
+}
+
 /* Point every MoE layer at the routers of the MoE layers after it (prefetch, statistics). */
 static void wire_routers(Glm53fModel *m)
 {
@@ -43,7 +50,8 @@ static void wire_routers(Glm53fModel *m)
 }
 
 int glm53f_model_open(Glm53fModel *m, const char *dir, const char *cfg_path, double cache_gb,
-                      int max_layers, int cap, int prefetch_n, int expert_i4, int gpu_planned)
+                      int max_layers, int cap, int prefetch_n, int expert_i4, int gpu_planned,
+                      int kv)
 {
     memset(m, 0, sizeof *m);
     char guess[4096];
@@ -143,15 +151,30 @@ int glm53f_model_open(Glm53fModel *m, const char *dir, const char *cfg_path, dou
     m->state = (float *)calloc(glm53f_kda_state_floats(c) * (size_t)m->n_bound, sizeof(float));
     m->kv = (float **)calloc((size_t)m->n_bound, sizeof(float *));
     m->idx = (float **)calloc((size_t)m->n_bound, sizeof(float *));
+    /* The compressed cache keeps the kv_lora latent per position instead of the expanded
+     * keys and values (64x less memory), folding kv_b into the query and the output. Past
+     * the dense-attention range the expanded form costs more RAM than a machine has, so
+     * that is where it becomes the default. */
+    const int compressed = kv == 2 || (kv == 0 && cap > glm53f_dense_attn_limit(c));
+    if (compressed)
+        printf("kv cache: kv_lora latent per position (%.1f KB per position, %.0fx less than "
+               "expanded)\n", (double)c->kv_lora * 4 * n_mla_layers(c) / 1024.0,
+               (double)glm53f_kv_floats_per_pos(c) / (double)c->kv_lora);
+    if (compressed) {
+        m->ckv = (float **)calloc((size_t)m->n_bound, sizeof(float *));
+        if (!m->ckv) { glm53f_model_close(m); return -1; }
+    }
     if (!m->state || !m->kv || !m->idx) { glm53f_model_close(m); return -1; }
     size_t kvb = 0, idxb = 0;
     for (L = 0; L < m->n_bound; L++) {
         if (!glm53f_is_mla(c, L)) continue;
-        const size_t n = (size_t)cap * glm53f_kv_floats_per_pos(c);
+        const size_t n = compressed ? (size_t)cap * c->kv_lora
+                                    : (size_t)cap * glm53f_kv_floats_per_pos(c);
         const size_t ni = glm53f_dsa_state_floats(c, cap);
-        m->kv[L] = (float *)malloc(n * sizeof(float));
+        if (compressed) m->ckv[L] = (float *)malloc(n * sizeof(float));
+        else            m->kv[L] = (float *)malloc(n * sizeof(float));
         m->idx[L] = (float *)calloc(ni, sizeof(float));
-        if (!m->kv[L] || !m->idx[L]) {
+        if ((compressed ? (void *)m->ckv[L] : (void *)m->kv[L]) == NULL || !m->idx[L]) {
             fprintf(stderr, "glm53f: cannot allocate the KV cache (%.2f GB per MLA layer)\n",
                     (double)n * 4 / 1e9);
             glm53f_model_close(m); return -1;
@@ -180,6 +203,8 @@ void glm53f_model_close(Glm53fModel *m)
     free(m->kv);
     if (m->idx) for (int L = 0; L < m->n_bound; L++) free(m->idx[L]);
     free(m->idx);
+    if (m->ckv) for (int L = 0; L < m->n_bound; L++) free(m->ckv[L]);
+    free(m->ckv);
     free(m->state);
     glm53f_bind_model_free(&m->mb);
     free(m->routers);
@@ -263,6 +288,11 @@ int glm53f_model_use_gpu(Glm53fModel *m, const int *devices, int ndev)
         fprintf(stderr, "glm53f: no CUDA device found; running on the CPU\n");
         return -1;
     }
+    if (m->ckv) {
+        fprintf(stderr, "glm53f: --gpu expands keys and values on the device; GLM53F_KV=compressed "
+                        "is a CPU path. Running on the CPU.\n");
+        return -1;
+    }
     /* The device attention kernels are dense; the DSA indexer runs on the CPU path only. */
     if (m->cap > glm53f_dense_attn_limit(&m->cfg)) {
         fprintf(stderr, "glm53f: --gpu handles up to %d positions (dense attention equals the "
@@ -331,7 +361,8 @@ int glm53f_model_forward(Glm53fModel *m, const int *ids, int T, float *logits, i
     for (int L = 0; L < m->n_bound; L++) {
         const long drops = glm53f_expert_drops;
         glm53f_decoder_layer(h, &m->lay[L].w, c, T, m->state + kper * (size_t)L, sc,
-                             m->kv[L], m->cached, m->cap, m->idx ? m->idx[L] : NULL);
+                             m->kv[L], m->cached, m->cap, m->idx ? m->idx[L] : NULL,
+                             m->ckv ? m->ckv[L] : NULL);
         if (glm53f_expert_drops != drops) {
             fprintf(stderr, "glm53f: routed expert load failed at layer %d; refusing partial output\n", L);
             rc = -1;

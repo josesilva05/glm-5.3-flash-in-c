@@ -69,7 +69,7 @@ int main(int argc, char **argv)
 
     printf("GLM-5.3-Flash engine vs transformers glm5_next, tiny random model\n");
     Glm53fModel m;
-    if (glm53f_model_open(&m, dir, NULL, 0.01, -1, nf, 0, 0, 0) != 0) { printf("  FAIL  model open\n"); return 1; }
+    if (glm53f_model_open(&m, dir, NULL, 0.01, -1, nf, 0, 0, 0, 0) != 0) { printf("  FAIL  model open\n"); return 1; }
 
     /* GATE 1 */
     float *lg = (float *)malloc((size_t)m.cfg.vocab * sizeof(float));
@@ -118,7 +118,7 @@ int main(int argc, char **argv)
     int dsa_match = -1;
     double dsa_worst = 0.0;
     if (nl > 0 && nlt == nl && ll && ll->t == J_ARR &&
-        glm53f_model_open(&m2, dir, NULL, 0.01, -1, nl, 0, 0, 0) == 0) {
+        glm53f_model_open(&m2, dir, NULL, 0.01, -1, nl, 0, 0, 0, 0) == 0) {
         int arg2[128];
         if (glm53f_model_forward(&m2, long_ids, nl, lg, arg2) == 0) {
             dsa_match = 0;
@@ -143,7 +143,7 @@ int main(int argc, char **argv)
         int all_ok = 1, runs = 0;
         for (int rep = 0; rep < 20 && all_ok; rep++, runs++) {
             Glm53fModel m3;
-            if (glm53f_model_open(&m3, dir, NULL, 0.0002, -1, nf, 4, 0, 0) != 0) { all_ok = 0; break; }
+            if (glm53f_model_open(&m3, dir, NULL, 0.0002, -1, nf, 4, 0, 0, 0) != 0) { all_ok = 0; break; }
             int ok3 = glm53f_model_forward(&m3, prompt, np, lg, NULL) == 0;
             for (int i = 0; ok3 && i < ng; i++) {
                 int b = 0;
@@ -170,7 +170,7 @@ int main(int argc, char **argv)
      * the devices so stream transfers between GPUs are exercised too. */
     {
         Glm53fModel mg;
-        if (glm53f_model_open(&mg, dir, NULL, 0.01, -1, nf, 4, 0, 1) != 0) { printf("  FAIL  GPU model open\n"); fails++; }
+        if (glm53f_model_open(&mg, dir, NULL, 0.01, -1, nf, 4, 0, 1, 0) != 0) { printf("  FAIL  GPU model open\n"); fails++; }
         else if (glm53f_model_use_gpu(&mg, NULL, 0) != 0) {
             printf("  SKIP  GPU gates: no usable CUDA device\n");
             glm53f_model_close(&mg);
