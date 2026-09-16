@@ -39,6 +39,7 @@ static void glm53f_fatal_bound(const char *what, long value, long limit)
 }
 
 long glm53f_expert_drops = 0;
+int  glm53f_quiet = 0;
 
 static inline float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
 
@@ -365,6 +366,79 @@ void glm53f_i4_from_f8(unsigned char *q, float *steps, const Glm53fMat *src)
                 dst[(j0 + j) >> 1] = (unsigned char)((lv[j] + 8) | ((lv[j + 1] + 8) << 4));
         }
     }
+}
+
+/* FP8 for T inputs at once: a column block's codes are decoded once and then used by every
+ * input, so the weights cross the memory bus once instead of T times. Per input the lanes,
+ * their order and the block scaling are exactly matmul_f8's. */
+#define GLM53F_MM_BATCH 64
+
+static void matmul_f8_batch(float *y, const float *x, int T, const Glm53fMat *m)
+{
+    e4m3_init();
+    const int in = m->cols, out = m->rows, br = m->br, bc = m->bc, scols = m->scols;
+    const unsigned char *W = (const unsigned char *)m->w;
+    const float *S = m->s;
+    int o;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (out > 64)
+#endif
+    for (o = 0; o < out; o++) {
+        const unsigned char *row = W + (size_t)o * in;
+        const float *srow = S + (size_t)(o / br) * scols;
+        double acc[GLM53F_MM_BATCH];
+        float wb[1024];
+        for (int t = 0; t < T; t++) acc[t] = 0.0;
+        for (int b = 0, j0 = 0; j0 < in; b++, j0 += bc) {
+            const int j1 = (j0 + bc < in) ? j0 + bc : in;
+            const int nb = j1 - j0;
+            for (int j = 0; j < nb; j++) wb[j] = GLM53F_E4M3[row[j0 + j]];
+            for (int t = 0; t < T; t++) {
+                const float *xt = x + (size_t)t * in;
+                int j = 0;
+                double bsum;
+#if defined(__AVX2__)
+                {
+                    __m256 v = _mm256_setzero_ps();
+                    for (; j + 8 <= nb; j += 8)
+                        v = _mm256_fmadd_ps(_mm256_loadu_ps(wb + j), _mm256_loadu_ps(xt + j0 + j), v);
+                    float a[8];
+                    _mm256_storeu_ps(a, v);
+                    bsum = (((double)a[0] + a[4]) + ((double)a[2] + a[6]))
+                         + (((double)a[1] + a[5]) + ((double)a[3] + a[7]));
+                }
+#else
+                {
+                    float a[8] = {0};
+                    for (; j + 8 <= nb; j += 8)
+                        for (int l = 0; l < 8; l++) a[l] = fmaf(wb[j + l], xt[j0 + j + l], a[l]);
+                    bsum = (((double)a[0] + a[4]) + ((double)a[2] + a[6]))
+                         + (((double)a[1] + a[5]) + ((double)a[3] + a[7]));
+                }
+#endif
+                for (; j < nb; j++) bsum += (double)wb[j] * (double)xt[j0 + j];
+                acc[t] += bsum * (double)srow[b];
+            }
+        }
+        for (int t = 0; t < T; t++) y[(size_t)t * out + o] = (float)acc[t];
+    }
+}
+
+void glm53f_mm_batch(float *y, const float *x, int T, const Glm53fMat *m)
+{
+    if (T < 1) return;
+    while (T > GLM53F_MM_BATCH) {                       /* the accumulator array is fixed */
+        glm53f_mm_batch(y, x, GLM53F_MM_BATCH, m);
+        y += (size_t)GLM53F_MM_BATCH * m->rows;
+        x += (size_t)GLM53F_MM_BATCH * m->cols;
+        T -= GLM53F_MM_BATCH;
+    }
+    if (m->dt == GLM53F_WF8 && m->cols <= 1024 * 1024 && m->bc <= 1024) {
+        matmul_f8_batch(y, x, T, m);
+        return;
+    }
+    for (int t = 0; t < T; t++)                          /* other formats: one at a time */
+        glm53f_mm(y + (size_t)t * m->rows, x + (size_t)t * m->cols, m);
 }
 
 void glm53f_mm(float *y, const float *x, const Glm53fMat *m)
@@ -906,6 +980,9 @@ void glm53f_router(int *idx, float *w, const float *x, const Glm53fMoeW *m, cons
  * expert ONCE and apply it to every (token, slot) that chose it. Each contribution is
  * kept per (token, slot) and summed in top-k order, so the result does not depend on the
  * order experts arrive from disk. */
+/* Tokens routed together. More of them share one pass over an expert's 25 MB in a prefill
+ * (at 64 an expert serves ~1.8 of them), but the union of experts per chunk grows with it,
+ * and past 64 the cache thrashes: 256 measured twice as slow (docs/PERFORMANCE.md). */
 #define GLM53F_MOE_CHUNK 64
 #define GLM53F_MOE_BATCH 16
 
@@ -916,7 +993,8 @@ size_t glm53f_moe_scratch(const Glm53fCfg *c, int T)
     return n * K * E                          /* contributions          */
          + n * K * 2                          /* idx (as float slots) + weights */
          + (size_t)3 * c->moe_inter + E       /* one expert's activations */
-         + glm53f_mlp_scratch(c) + E;         /* shared expert          */
+         + glm53f_mlp_scratch(c) + E          /* shared expert          */
+         + n * (2 * E + 3 * (size_t)c->moe_inter);  /* one expert's tokens, batched */
 }
 
 /* ---- expert-prediction statistics (GLM53F_PREDICT_STATS=1) ----
@@ -1035,10 +1113,17 @@ static void moe_chunk(float *out, const float *x, const Glm53fMoeW *w, const Glm
     float *eo      = act + I;
     float *shs     = eo + E;
     float *sho     = shs + glm53f_mlp_scratch(c);
+    /* one expert's tokens gathered together, so its weights are read once for all of them */
+    float *xb      = sho + E;                 /* strides follow T, as glm53f_moe_scratch does */
+    float *g1b     = xb + (size_t)T * E;
+    float *g2b     = g1b + (size_t)T * I;
+    float *actb    = g2b + (size_t)T * I;
+    float *outb    = actb + (size_t)T * I;
 
-    int uniq[64 * GLM53F_MAX_TOPK];
+    int uniq[GLM53F_MOE_CHUNK * GLM53F_MAX_TOPK];
     unsigned char seen[1024];
-    if (NE > 1024 || T > 64) glm53f_fatal_bound("MoE chunk", T, 64);
+    if (NE > 1024) glm53f_fatal_bound("routed experts", NE, 1024);
+    if (T > GLM53F_MOE_CHUNK) glm53f_fatal_bound("MoE chunk", T, GLM53F_MOE_CHUNK);
     memset(seen, 0, (size_t)NE);
     int nu = 0;
     for (int t = 0; t < T; t++) {
@@ -1135,15 +1220,33 @@ static void moe_chunk(float *out, const float *x, const Glm53fMoeW *w, const Glm
                             memset(contrib + ((size_t)t * K + j) * E, 0, (size_t)E * sizeof(float));
                 continue;
             }
+            /* every (token, slot) that chose this expert, so one pass over its weights
+             * serves all of them; each token's own sums keep their order, bit for bit */
+            int tok[GLM53F_MOE_CHUNK], slot[GLM53F_MOE_CHUNK], nt = 0;
             for (int t = 0; t < T; t++)
-                for (int j = 0; j < K; j++) {
-                    if (ids[(size_t)t * K + j] != e) continue;
-                    const float *xt = x + (size_t)t * E;
-                    glm53f_mm(gu, xt, &q.gate);
-                    glm53f_mm(gu + I, xt, &q.up);
-                    glm53f_swiglu_clamp(act, gu, I, c->swiglu_limit);
-                    glm53f_mm(contrib + ((size_t)t * K + j) * E, act, &q.down);
+                for (int j = 0; j < K; j++)
+                    if (ids[(size_t)t * K + j] == e) { tok[nt] = t; slot[nt] = j; nt++; }
+            if (nt == 1) {                       /* decode: one token, no gathering */
+                const float *xt = x + (size_t)tok[0] * E;
+                glm53f_mm(gu, xt, &q.gate);
+                glm53f_mm(gu + I, xt, &q.up);
+                glm53f_swiglu_clamp(act, gu, I, c->swiglu_limit);
+                glm53f_mm(contrib + ((size_t)tok[0] * K + slot[0]) * E, act, &q.down);
+            } else if (nt > 1) {
+                for (int i = 0; i < nt; i++)
+                    memcpy(xb + (size_t)i * E, x + (size_t)tok[i] * E, (size_t)E * sizeof(float));
+                glm53f_mm_batch(g1b, xb, nt, &q.gate);
+                glm53f_mm_batch(g2b, xb, nt, &q.up);
+                for (int i = 0; i < nt; i++) {
+                    memcpy(gu, g1b + (size_t)i * I, (size_t)I * sizeof(float));
+                    memcpy(gu + I, g2b + (size_t)i * I, (size_t)I * sizeof(float));
+                    glm53f_swiglu_clamp(actb + (size_t)i * I, gu, I, c->swiglu_limit);
                 }
+                glm53f_mm_batch(outb, actb, nt, &q.down);
+                for (int i = 0; i < nt; i++)
+                    memcpy(contrib + ((size_t)tok[i] * K + slot[i]) * E, outb + (size_t)i * E,
+                           (size_t)E * sizeof(float));
+            }
             if (trace_on) {
                 clock_gettime(CLOCK_MONOTONIC, &tr_a);
                 tr_comp += (double)(tr_a.tv_sec - tr_b.tv_sec) * 1e6 + (double)(tr_a.tv_nsec - tr_b.tv_nsec) / 1e3;

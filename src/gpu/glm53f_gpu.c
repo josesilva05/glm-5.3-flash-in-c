@@ -688,17 +688,20 @@ Glm53fGpu *glm53f_gpu_create(Glm53fModel *m, const int *devices, int ndev)
     const size_t widened = widen_resident(g);
     warm_start(g);
 
+    if (!glm53f_quiet)
     printf("gpu: trunk placed on %d device(s):", g->ndev);
     for (int i = 0; i < g->ndev; i++) {
         if (!g->dev[i].used) continue;
         int first = -1, lastl = -1;
         size_t bytes = 0;
         for (int L = 0; L < g->nl; L++) if (g->lay[L].dev == i) { if (first < 0) first = L; lastl = L; bytes += g->lay[L].bytes; }
+        if (!glm53f_quiet)
         printf(" [cuda:%d layers %d-%d, %.2f GB + %.2f GB scratch%s]", g->dev[i].id, first, lastl,
                (double)bytes / 1e9, (double)g->dev[i].scratch_bytes / 1e9, i == g->head ? " + lm_head" : "");
     }
+    if (!glm53f_quiet)
     printf("\n");
-    if (widened) printf("gpu: %.2f GB of weights kept as fp32 copies in spare device memory\n", (double)widened / 1e9);
+    if (widened && !glm53f_quiet) printf("gpu: %.2f GB of weights kept as fp32 copies in spare device memory\n", (double)widened / 1e9);
     return g;
 }
 

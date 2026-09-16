@@ -428,16 +428,21 @@ void glm53f_cache_report(const Glm53fCache *c, const char *label)
     const uint64_t n = c->hits + c->misses;
     int resident = 0;
     for (int i = 0; i < c->nslot; i++) if (c->key_of[i] >= 0) resident++;
+    if (!glm53f_quiet)
     printf("expert cache [%s]\n", label ? label : "");
+    if (!glm53f_quiet)
     printf("  slots          : %d x %.2f MB = %.2f GB (%d resident), %d prefetch threads\n",
            c->nslot, (double)c->slot_bytes / 1e6, (double)c->nslot * c->slot_bytes / 1e9,
            resident, c->n_io);
     const uint64_t served = c->hits > c->prefetch_reads ? c->hits - c->prefetch_reads : 0;
+    if (!glm53f_quiet)
     printf("  requests       : %llu, resident when requested: %llu (%.1f%%)\n",
            (unsigned long long)n, (unsigned long long)served, n ? 100.0 * served / n : 0.0);
+    if (!glm53f_quiet)
     printf("  foreground     : %.2f GB read, %.2f s reading or waiting, %llu evictions\n",
            (double)c->bytes_read / 1e9, c->load_seconds, (unsigned long long)c->evictions);
     if (c->n_io)
+        if (!glm53f_quiet)
         printf("  prefetch       : %llu experts read ahead (%.2f GB), %llu of them used\n",
                (unsigned long long)c->bg_reads, (double)c->bg_bytes / 1e9,
                (unsigned long long)c->bg_used);

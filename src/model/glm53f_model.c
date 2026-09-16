@@ -71,6 +71,7 @@ int glm53f_model_open(Glm53fModel *m, const char *dir, const char *cfg_path, dou
 
     const double t0 = now_s();
     if (glm53f_st_open(&m->st, dir) != 0) return -1;
+    if (!glm53f_quiet)
     printf("indexed %d tensors from %d shards in %.2f s\n", m->st.nt, m->st.nshard, now_s() - t0);
 
     m->n_bound = (max_layers > 0 && max_layers < c->n_layers) ? max_layers : c->n_layers;
@@ -108,6 +109,7 @@ int glm53f_model_open(Glm53fModel *m, const char *dir, const char *cfg_path, dou
     if (failed) { glm53f_model_close(m); return -1; }
     if (glm53f_bind_model(&m->st, c, &m->mb) != 0) { glm53f_model_close(m); return -1; }
     m->load_seconds = now_s() - tb;
+    if (!glm53f_quiet)
     printf("trunk: %d layers, %.2f GB resident + %.2f GB embeddings/lm_head, loaded in %.1f s\n",
            m->n_bound, (double)total / 1e9, (double)m->mb.nbytes / 1e9, m->load_seconds);
 
@@ -146,6 +148,7 @@ int glm53f_model_open(Glm53fModel *m, const char *dir, const char *cfg_path, dou
             glm53f_model_close(m);
             return -1;
         }
+        if (!glm53f_quiet)
         printf("NOTE: --cache-gb %.1f does not fit: %.1f GB of RAM is free and this session also "
                "needs%.1f GB\n      (attention caches, indexer, work buffers) plus 3 GB of headroom; "
                "using %.1f GB of cache.\n",
@@ -172,6 +175,7 @@ int glm53f_model_open(Glm53fModel *m, const char *dir, const char *cfg_path, dou
      * that is where it becomes the default. */
     const int compressed = kv == 2 || (kv == 0 && cap > glm53f_dense_attn_limit(c));
     if (compressed)
+        if (!glm53f_quiet)
         printf("kv cache: kv_lora latent per position (%.1f KB per position, %.0fx less than "
                "expanded)\n", (double)c->kv_lora * 4 * n_mla_layers(c) / 1024.0,
                (double)glm53f_kv_floats_per_pos(c) / (double)c->kv_lora);
@@ -197,6 +201,7 @@ int glm53f_model_open(Glm53fModel *m, const char *dir, const char *cfg_path, dou
         kvb += n * sizeof(float);
         idxb += ni * sizeof(float);
     }
+    if (!glm53f_quiet)
     printf("expert cache: %d slots x %.2f MB = %.2f GB | KV cache %.2f GB + DSA index %.2f GB "
            "for %d positions | KDA state %.2f MB\n\n",
            m->cache.nslot, (double)m->cache.slot_bytes / 1e6,
@@ -291,6 +296,7 @@ static void release_host_trunk(Glm53fModel *m)
     memset(&m->mb.lm_head, 0, sizeof m->mb.lm_head);
     m->mb.norm = NULL;
     m->routers = routers;
+    if (!glm53f_quiet)
     printf("host: freed %.2f GB of trunk weights now on the GPU (kept %.2f GB: embeddings + routers)\n\n",
            (double)freed / 1e9, (double)(eb + (size_t)nmoe * per * sizeof(float)) / 1e9);
 }

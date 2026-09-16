@@ -25,6 +25,7 @@
 #include "glm53f.h"
 #include "glm53f_model.h"
 #include "glm53f_mtp.h"
+#include "glm53f_chat.h"
 #include "glm53f_tok.h"
 
 #ifndef GLM53F_VERSION
@@ -125,6 +126,10 @@ static void usage(FILE *f)
 "  --dump-logits PATH    float32 logits of the prompt's last position\n"
 "  --out FILE            JSON results (default glm53f_run.json)\n"
 "  --quiet               no per-step table\n"
+"  --chat                interactive session: the model stays loaded and each turn\n"
+"                        continues the conversation instead of re-reading it\n"
+"  --ctx N               positions an interactive session may hold (default 2048,\n"
+"                        or 4096 without --gpu)\n"
 "  --version, --help\n"
 "\n"
 "Beyond index_topk + index_kpool - 1 positions (2051) the DSA indexer selects which\n"
@@ -149,7 +154,7 @@ int main(int argc, char **argv)
     const char *cfg_path = NULL, *logits_path = NULL, *outp = "glm53f_run.json";
     const char *reasoning = "max";
     int gen = 256, max_layers = -1, raw = 0, no_stop = 0, quiet = 0, prefetch_n = 6, use_gpu = 0;
-    int expert_i4 = 0, kv_mode = 0;
+    int expert_i4 = 0, kv_mode = 0, chat = 0, ctx = 0;
     double cache_gb = 16.0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
@@ -181,10 +186,17 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) logits_path = argv[++i];
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
         else if (!strcmp(argv[i], "--quiet")) quiet = 1;
+        else if (!strcmp(argv[i], "--chat")) chat = 1;
+        else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
         else { fprintf(stderr, "unknown or incomplete option %s\n\n", argv[i]); usage(stderr); return 2; }
     }
-    if ((ids_s != NULL) + (prompt_text != NULL) + (prompt_file != NULL) != 1) {
-        fprintf(stderr, "exactly one of --ids, --prompt or --prompt-file is required\n");
+    if (!chat && (ids_s != NULL) + (prompt_text != NULL) + (prompt_file != NULL) != 1) {
+        fprintf(stderr, "exactly one of --ids, --prompt or --prompt-file is required, "
+                        "or --chat for an interactive session\n");
+        return 2;
+    }
+    if (chat && (ids_s || prompt_text || prompt_file)) {
+        fprintf(stderr, "--chat starts an empty session; it takes no prompt\n");
         return 2;
     }
     if (gen < 0 || gen > GLM53F_MAX_GEN) {
@@ -194,6 +206,49 @@ int main(int argc, char **argv)
     const char *effort = !strcmp(reasoning, "low") ? "Low" : !strcmp(reasoning, "high") ? "High"
                        : !strcmp(reasoning, "max") ? "Max" : NULL;
     if (!effort) { fprintf(stderr, "--reasoning must be max, high or low\n"); return 2; }
+
+    /* ---- interactive session ---- */
+    if (chat) {
+        const int cap = ctx > 0 ? ctx : (use_gpu ? 2048 : 4096);
+        Glm53fModel cm;
+        Tok ctok;
+        /* The session opens with the session, not with a load log. */
+        glm53f_quiet = 1;
+        const double t_load = now_s();
+        printf("  loading the model…");
+        fflush(stdout);
+        glm53f_tok_load(&ctok, tok_dir ? tok_dir : dir);
+        if (glm53f_model_open(&cm, dir, cfg_path, cache_gb, max_layers, cap, prefetch_n,
+                              expert_i4, use_gpu, kv_mode) != 0)
+            return 1;
+        int on_gpu = 0;
+        if (use_gpu) {
+            on_gpu = glm53f_model_use_gpu(&cm, NULL, 0) == 0;
+            (void)0;
+            if (!on_gpu) printf("NOTE: --gpu requested but the trunk stays on the CPU.\n\n");
+        }
+        Glm53fChat s;
+        memset(&s, 0, sizeof s);
+        s.m = &cm; s.tok = &ctok; s.dir = dir;
+        s.reasoning = !strcmp(reasoning, "low") ? "Low" : !strcmp(reasoning, "high") ? "High" : "Max";
+        s.gen = gen; s.prefetch = prefetch_n; s.on_gpu = on_gpu; s.cache_gb = cache_gb;
+        s.colour = 1;
+        s.load_s = now_s() - t_load;
+        printf("\r%*s\r", 24, "");
+        for (int L = 0; L < cm.cfg.n_layers; L++)
+            if (glm53f_is_mla(&cm.cfg, L)) s.n_mla++; else s.n_kda++;
+        s.ids_cap = GLM53F_MAX_PROMPT;
+        s.ids = (int *)malloc((size_t)s.ids_cap * sizeof(int));
+        s.out = (int *)malloc((size_t)GLM53F_MAX_GEN * sizeof(int));
+        s.text_cap = GLM53F_MAX_GEN * 64 + 1;
+        s.text = (char *)malloc((size_t)s.text_cap);
+        s.logits = (float *)malloc((size_t)cm.cfg.vocab * sizeof(float));
+        int rc = 1;
+        if (s.ids && s.out && s.text && s.logits) rc = glm53f_chat_run(&s);
+        free(s.ids); free(s.out); free(s.text); free(s.logits);
+        glm53f_model_close(&cm);
+        return rc;
+    }
 
     /* ---- prompt ---- */
     int *prompt = (int *)malloc((size_t)GLM53F_MAX_PROMPT * sizeof(int));
@@ -231,8 +286,15 @@ int main(int argc, char **argv)
     if (np == 0) { fprintf(stderr, "empty prompt\n"); return 2; }
     printf("glm53f " GLM53F_VERSION " | model %s | prompt %d tokens | generating up to %d\n",
            dir, np, gen);
+    /* The ids make a run reproducible with --ids; a long prompt only shows its ends. */
     printf("prompt ids:");
-    for (int i = 0; i < np; i++) printf("%s%d", i ? "," : " ", prompt[i]);
+    if (np <= 40) {
+        for (int i = 0; i < np; i++) printf("%s%d", i ? "," : " ", prompt[i]);
+    } else {
+        for (int i = 0; i < 12; i++) printf("%s%d", i ? "," : " ", prompt[i]);
+        printf(" ... %d more ...", np - 16);
+        for (int i = np - 4; i < np; i++) printf(",%d", prompt[i]);
+    }
     printf("\n");
 
     /* ---- model ---- */

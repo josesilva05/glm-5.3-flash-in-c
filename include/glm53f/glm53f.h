@@ -136,6 +136,11 @@ typedef struct {
 /* y[rows] = M . x[cols]. Parallel over output rows; deterministic at any thread count. */
 void glm53f_mm(float *y, const float *x, const Glm53fMat *m);
 
+/* The same product for T stacked inputs: y is [T][rows], x is [T][cols]. Each weight row is
+ * read once for all T, which is what makes a prefill cheap; every output element is the
+ * same sum in the same order as glm53f_mm, bit for bit. */
+void glm53f_mm_batch(float *y, const float *x, int T, const Glm53fMat *m);
+
 /* Quantise an FP8 matrix into GLM53F_WI4: q holds rows*(cols/2) bytes, steps rows*groups
  * floats (groups = cols / GLM53F_I4_GROUP). Symmetric, one step per group: step = max|w|/7,
  * level = lrintf(w/step) clamped to [-8, 7]. cols must be a multiple of the group. */
@@ -261,6 +266,11 @@ typedef struct {
 /* ------------------------------------------------------------------ kernels ---- */
 /* Routed experts that failed to load. Non-zero means corrupt output; callers must fail. */
 extern long glm53f_expert_drops;
+
+/* Non-zero silences the engine's progress lines (what was indexed, what is resident, where
+ * the trunk went). Errors and warnings always print. The interactive session sets it so the
+ * screen starts with the session, not with a load log. */
+extern int glm53f_quiet;
 
 /* mHC collapse. h is [M][hidden]. Writes pre-collapsed x[hidden], post[M], comb[M*M]. */
 void glm53f_hc_pre(float *x, float *post, float *comb, const float *h,

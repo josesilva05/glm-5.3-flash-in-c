@@ -55,7 +55,7 @@ $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(BIN)/glm53f: src/cli/glm53f_run.c $(ENGINE_OBJ)
+$(BIN)/glm53f: src/cli/glm53f_run.c src/cli/glm53f_chat.c $(ENGINE_OBJ)
 	@mkdir -p $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 

@@ -34,6 +34,9 @@
 #include <string.h>
 #include "json.h"
 
+/* Defined by the engine (glm53f.h); declared here so the tokenizer header stands alone. */
+extern int glm53f_quiet;
+
 /* tok.h is a header-only library, vendored with the changes listed in NOTICE. Every function in it
  * has file scope, so a translation unit that uses only part of the API draws
  * -Wunused-function for the remainder.
@@ -205,7 +208,8 @@ static inline void glm53f_tok_load(Tok *T, const char *files_dir)
     /* longest match first, so "<|end_of_msg|>" wins over any prefix of it */
     qsort(T->sp, (size_t)T->nsp, sizeof(Special), cmp_sp_len);
 
-    fprintf(stderr, "[TOK] %d ranks (max id %d) + %d added tokens\n", nrank, maxrank, T->nsp);
+    if (!glm53f_quiet)
+        fprintf(stderr, "[TOK] %d ranks (max id %d) + %d added tokens\n", nrank, maxrank, T->nsp);
 }
 
 #endif /* GLM53F_TOK_H */
