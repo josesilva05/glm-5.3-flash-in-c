@@ -57,6 +57,7 @@ add_library(glm53f STATIC
   src/core/glm53f_dsa.c
   src/io/glm53f_st.c
   src/io/glm53f_load.c
+  src/io/glm53f_i4file.c
   src/cache/glm53f_cache.c
   src/model/glm53f_bind.c
   src/model/glm53f_model.c
@@ -89,11 +90,19 @@ if(OpenMP_C_FOUND)
 endif()
 
 # ------------------------------------------------------------------------------ cli --
-add_executable(glm53f_cli src/cli/glm53f_run.c src/cli/glm53f_chat.c)
+add_executable(glm53f_cli src/cli/glm53f_run.c src/cli/glm53f_chat.c src/cli/glm53f_tui.c)
 set_target_properties(glm53f_cli PROPERTIES OUTPUT_NAME glm53f)
 target_link_libraries(glm53f_cli PRIVATE glm53f)
 if(WIN32)
   target_link_libraries(glm53f_cli PRIVATE psapi)
+endif()
+
+# localcode: the same program opening straight into the interactive session.
+add_executable(localcode src/cli/glm53f_run.c src/cli/glm53f_chat.c src/cli/glm53f_tui.c)
+target_compile_definitions(localcode PRIVATE GLM53F_LOCALCODE=1)
+target_link_libraries(localcode PRIVATE glm53f)
+if(WIN32)
+  target_link_libraries(localcode PRIVATE psapi)
 endif()
 
 # ---------------------------------------------------------------------------- tests --
@@ -143,4 +152,4 @@ set_tests_properties(tokenizer PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED:")
 add_executable(bench_expert_io tools/bench_expert_io.c)
 target_link_libraries(bench_expert_io PRIVATE glm53f)
 
-install(TARGETS glm53f_cli RUNTIME DESTINATION bin)
+install(TARGETS glm53f_cli localcode RUNTIME DESTINATION bin)

@@ -275,6 +275,8 @@ extern long glm53f_expert_drops;
  * the trunk went). Errors and warnings always print. The interactive session sets it so the
  * screen starts with the session, not with a load log. */
 extern int glm53f_quiet;
+/* --int4-dir: a directory of int4 expert files (glm53f_i4file.h), or NULL. */
+extern const char *glm53f_i4_dir;
 
 /* mHC collapse. h is [M][hidden]. Writes pre-collapsed x[hidden], post[M], comb[M*M]. */
 void glm53f_hc_pre(float *x, float *post, float *comb, const float *h,

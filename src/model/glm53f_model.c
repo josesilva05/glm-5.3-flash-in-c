@@ -177,6 +177,12 @@ int glm53f_model_open(Glm53fModel *m, const char *dir, const char *cfg_path, dou
     if (glm53f_cache_init(&m->cache, &m->st, c, budget, n_io, expert_i4) != 0) {
         glm53f_model_close(m); return -1;
     }
+    if (expert_i4 && glm53f_i4_dir && !glm53f_quiet) {
+        int nmoe = 0;
+        for (L = 0; L < c->n_layers; L++) nmoe += !glm53f_is_dense(c, L);
+        printf("int4 container: %d of %d MoE layers read from %s%s\n", m->cache.i4_layers, nmoe,
+               glm53f_i4_dir, m->cache.i4_layers < nmoe ? "; the others are quantised on the way in" : "");
+    }
     for (L = 0; L < m->n_bound; L++)
         if (!m->lay[L].w.is_dense) {
             m->lay[L].w.moe.src = &m->cache.src;

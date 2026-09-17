@@ -294,6 +294,18 @@ static inline int glm53f_win_open(const char *path, int flags, ...)
                             FILE_SHARE_READ | FILE_SHARE_WRITE,
                             NULL, OPEN_EXISTING, fileFlags, NULL);
     if (h == INVALID_HANDLE_VALUE) { errno = ENOENT; return -1; }
+    /* GLM53F_IO_PRIORITY=low: the checkpoint's reads queue behind everyone else's (the
+     * system, the page file on the same drive, other programs), which keeps the machine
+     * responsive. It is not the default because Windows also slows low-priority reads on
+     * an otherwise idle drive: decode measured 13% slower with the same bytes read. */
+    if ((flags & O_DIRECT) && access == GENERIC_READ) {
+        const char *prio = getenv("GLM53F_IO_PRIORITY");
+        if (prio && strcmp(prio, "low") == 0) {
+            FILE_IO_PRIORITY_HINT_INFO hint;
+            hint.PriorityHint = IoPriorityHintLow;
+            SetFileInformationByHandle(h, FileIoPriorityHintInfo, &hint, sizeof hint);
+        }
+    }
 
     int fd = _open_osfhandle((intptr_t)h, crtFlags | _O_BINARY);
     if (fd < 0) { CloseHandle(h); errno = EMFILE; return -1; }

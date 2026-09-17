@@ -40,6 +40,7 @@ static void glm53f_fatal_bound(const char *what, long value, long limit)
 
 long glm53f_expert_drops = 0;
 int  glm53f_quiet = 0;
+const char *glm53f_i4_dir = NULL;
 
 static inline float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
 
