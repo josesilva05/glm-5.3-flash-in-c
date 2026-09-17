@@ -7,6 +7,29 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- int4 expert container: `--write-int4 DIR` quantises the routed experts into one file per
+  MoE layer (resumable, fingerprinted against the checkpoint, a CRC per expert,
+  `--verify-int4`), and `--int4-dir DIR` reads them straight into cache slots. Bit-identical
+  to `--experts int4` (6 layers, `--gpu`: same logits and tokens) with 44% fewer bytes read;
+  in `localcode` with 25 of 42 layers converted, 1.12-1.17 s/token against 1.77 for the
+  exact path, and the drive stayed at or below 70 °C where the exact path holds it at 78 °C.
+  An approximation of the checkpoint, off unless asked for.
+- Windows: `GLM53F_IO_PRIORITY=low` marks the checkpoint's reads low I/O priority, so the
+  system and other programs go first while the model reads. Not the default: with the same
+  bytes read, decode measured 13% slower (2.44/2.35 -> 2.83/2.66 s/token).
+
+- `localcode`, the interactive session as its own program (the same one as `glm53f --chat`,
+  on the GPUs when built with CUDA; model from the argument or `LOCALCODE_MODEL`), now a
+  full-screen terminal interface in a green palette (`src/cli/glm53f_tui.c`): the
+  conversation scrolls above an input box fixed at the bottom, with a footer for the
+  directory and the context used; reasoning folded into one live line (`/thinking` shows
+  it); the answer's Markdown rendered while it streams; a numbers line after each answer.
+  The model runs on a worker thread, so the screen scrolls (wheel, PgUp/PgDn) and takes the
+  next message (queued) while an answer is written; Esc or Ctrl+C stops it. The input box
+  edits in place, keeps a history, and a paste with line breaks stays one message.
+  `/file PATH [question]` sends a document; answers default to 2048 tokens. Pipes get a
+  plain line-by-line session (`LOCALCODE_PLAIN`, `LOCALCODE_TUI` choose explicitly). A turn
+  is now reported as events that both front ends consume.
 - Interactive session, `--chat` (with `--ctx N`): the model stays loaded and each turn feeds
   only its new tokens, reusing the KV cache, the KDA state and the indexer; reasoning dimmed,
   answer after a separator, per-turn numbers; `/reset`, `/params`, `/gen`, `/reasoning`,

@@ -96,6 +96,7 @@ include/glm53f/glm53f_cfg.h   strict config.json reader
 src/core/glm53f_ops.c         kernels: matmul (fp32/BF16/FP8), norms, SwiGLU, conv, mHC, KDA, MLA, router, MoE, decoder layer
 src/io/glm53f_st.c/.h         safetensors index (hash table over 76k tensors), positioned and O_DIRECT reads
 src/io/glm53f_load.c/.h       routed-expert geometry and two-read expert loading
+src/io/glm53f_i4file.c/.h     the int4 expert container: writing, checking, opening per layer
 src/io/glm53f_portable_io.h   POSIX shims for Windows/macOS (pread, O_DIRECT, aligned allocation)
 src/cache/glm53f_cache.c/.h   LRU cache of routed experts, parallel batch prefetch
 src/model/glm53f_bind.c/.h    checkpoint tensors -> weight structs, with dtype and shape checks
@@ -104,7 +105,8 @@ src/tokenizer/glm53f_tok.h    tokenizer from tiktoken.model + tokenizer_config.j
 src/gpu/glm53f_gpu.c/.h       CUDA backend, host side: placement, fp32 copies, keep-warm, forward (optional)
 src/gpu/glm53f_gpu_kernels.*  CUDA kernels mirroring glm53f_ops.c
 src/cli/glm53f_run.c          command line: chat template, greedy decode, EOS, reports
-src/cli/glm53f_chat.c/.h      interactive session (--chat): turns, commands, /save
+src/cli/glm53f_chat.c/.h      interactive session (localcode, --chat): commands, a turn as events, /save
+src/cli/glm53f_tui.c          localcode's full-screen terminal interface (worker thread, raw VT input)
 third_party/                  json.h, tok.h (BPE), Unicode tables
 ```
 

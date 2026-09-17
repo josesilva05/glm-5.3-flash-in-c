@@ -27,6 +27,13 @@
 #include "glm53f_mtp.h"
 #include "glm53f_chat.h"
 #include "glm53f_tok.h"
+#include "glm53f_cfg.h"
+#include "glm53f_i4file.h"
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
 
 #ifndef GLM53F_VERSION
 #define GLM53F_VERSION "2.0.0-glm"
@@ -86,6 +93,29 @@ static int utf8_complete(const char *s, int n)
     return (back + 1 >= need) ? n : i - 1;
 }
 
+#ifdef GLM53F_LOCALCODE
+/* localcode: the same options, opening straight into the interactive session. */
+static void usage(FILE *f)
+{
+    fprintf(f,
+"localcode, a local terminal chat with GLM-5.3-Flash (glm53f " GLM53F_VERSION ")\n"
+"\n"
+"usage: localcode [model_dir] [options]\n"
+"\n"
+"The model directory is the first argument, or LOCALCODE_MODEL in the environment.\n"
+"The trunk runs on the GPUs when built with CUDA; --cpu keeps it on the CPU.\n"
+"\n"
+"  --reasoning LEVEL     max (default) | high | low\n"
+"  --gen N               tokens per answer (default 2048)\n"
+"  --ctx N               positions the session may hold (default 2048, 4096 on the CPU)\n"
+"  --cache-gb X|auto     routed-expert cache (default auto: the free RAM less a fifth\n"
+"                        of the installed RAM)\n"
+"  --cpu                 do not use the GPUs\n"
+"  --prefetch N, --kv auto|expanded|compressed, --experts fp8|int4, --tok DIR\n"
+"                        as in glm53f --help\n"
+"  --version, --help\n");
+}
+#else
 static void usage(FILE *f)
 {
     fprintf(f,
@@ -116,6 +146,8 @@ static void usage(FILE *f)
 "  --experts fp8|int4    fp8 (default) streams the checkpoint own expert weights; int4\n"
 "                        re-quantises them in the cache, fitting 1.8x more experts in the\n"
 "                        same RAM at the cost of an APPROXIMATE output\n"
+"  --int4-dir DIR        read int4 experts from a container written by --write-int4\n"
+"                        (44%% fewer bytes per read than FP8; implies --experts int4)\n"
 "  --gpu                 run the trunk on the CUDA devices (build with -DGLM53F_CUDA=ON);\n"
 "                        routed experts stay on the CPU. The host copy of the trunk\n"
 "                        is freed (~14 GB), and auto counts it as free\n"
@@ -133,8 +165,65 @@ static void usage(FILE *f)
 "                        or 4096 without --gpu)\n"
 "  --version, --help\n"
 "\n"
+"int4 container (an approximation of the checkpoint, written next to it):\n"
+"  --write-int4 DIR      quantise the routed experts into DIR, one file per MoE layer;\n"
+"                        resumable, ~4.1 GB per layer, ~171 GB for all 42\n"
+"  --verify-int4 DIR     check every expert in DIR against its CRC\n"
+"  --i4-layers A-B       only these layers (with --write-int4 / --verify-int4)\n"
+"\n"
 "Beyond index_topk + index_kpool - 1 positions (2051) the DSA indexer selects which\n"
 "positions each query attends to, as the model does; --gpu is limited to that dense range.\n");
+}
+#endif
+
+/* --write-int4 / --verify-int4: the container, layer by layer, without binding the trunk. */
+static int convert_i4(const char *dir, const char *cfg_path, const char *out, int verify, int from, int to)
+{
+    Glm53fCfg cfg;
+    char guess[4096];
+    if (!cfg_path) { snprintf(guess, sizeof guess, "%s/config.json", dir); cfg_path = guess; }
+    if (!glm53f_cfg_load_file(&cfg, cfg_path)) return 1;
+    Glm53fSt st;
+    if (glm53f_st_open(&st, dir) != 0) return 1;
+    if (!verify) {
+#ifdef _WIN32
+        _mkdir(out);
+#else
+        mkdir(out, 0755);
+#endif
+    }
+    if (to < 0 || to >= cfg.n_layers) to = cfg.n_layers - 1;
+    if (from < 0) from = 0;
+    printf("%s int4 experts, layers %d-%d, %s %s\n\n", verify ? "verifying" : "writing", from, to,
+           verify ? "in" : "into", out);
+    int failed = 0, done = 0;
+    const double t_all = now_s();
+    for (int L = from; L <= to; L++) {
+        if (glm53f_is_dense(&cfg, L)) continue;
+        const double t0 = now_s();
+        if (verify) {
+            const int bad = glm53f_i4file_verify_layer(&st, &cfg, L, out);
+            if (bad == 0) printf("  layer %2d: all %d experts match their CRC (%.1f s)\n", L, cfg.n_experts, now_s() - t0);
+            else if (bad > 0) { printf("  layer %2d: %d experts DO NOT match\n", L, bad); failed = 1; }
+            else printf("  layer %2d: no usable file\n", L);
+            continue;
+        }
+        const int rc = glm53f_i4file_write_layer(&st, &cfg, L, out);
+        const double dt = now_s() - t0;
+        if (rc == 1) printf("  layer %2d: already complete\n", L);
+        else if (rc == 0) {
+            done++;
+            printf("  layer %2d: written in %.0f s (%.1f GB of FP8 read, %.2f GB/s)\n", L, dt,
+                   cfg.n_experts * 25.19e6 / 1e9, cfg.n_experts * 25.19e6 / 1e9 / (dt > 0 ? dt : 1));
+        } else {
+            printf("  layer %2d: FAILED; stopping (a rerun resumes from here)\n", L);
+            failed = 1;
+            break;
+        }
+    }
+    if (!verify) printf("\n%d layer(s) written in %.0f s\n", done, now_s() - t_all);
+    glm53f_st_close(&st);
+    return failed ? 1 : 0;
 }
 
 int main(int argc, char **argv)
@@ -148,22 +237,41 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
         if (!strcmp(argv[i], "--version")) { printf("glm53f %s\n", GLM53F_VERSION); return 0; }
     }
+#ifdef GLM53F_LOCALCODE
+    const int named = argc >= 2 && argv[1][0] != '-';
+    const char *dir = named ? argv[1] : getenv("LOCALCODE_MODEL");
+    const int first_opt = named ? 2 : 1;
+    if (!dir) {
+        fprintf(stderr, "localcode: give the model directory, or set LOCALCODE_MODEL\n\n");
+        usage(stderr);
+        return 2;
+    }
+#else
     if (argc < 2 || argv[1][0] == '-') { usage(stderr); return 2; }
     const char *dir = argv[1];
+    const int first_opt = 2;
+#endif
 
     const char *ids_s = NULL, *prompt_text = NULL, *prompt_file = NULL, *tok_dir = NULL;
     const char *cfg_path = NULL, *logits_path = NULL, *outp = "glm53f_run.json";
     const char *reasoning = "max";
     int gen = 256, max_layers = -1, raw = 0, no_stop = 0, quiet = 0, prefetch_n = 6, use_gpu = 0;
-    int expert_i4 = 0, kv_mode = 0, chat = 0, ctx = 0;
+    int expert_i4 = 0, kv_mode = 0, chat = 0, ctx = 0, gen_given = 0, i4_from = 0, i4_to = -1;
+    const char *i4_dir = NULL, *write_i4 = NULL, *verify_i4 = NULL;
     double cache_gb = 0.0;                       /* 0: sized from the free RAM */
-    for (int i = 2; i < argc; i++) {
+#ifdef GLM53F_LOCALCODE
+    chat = 1;
+#ifdef GLM53F_CUDA
+    use_gpu = 1;
+#endif
+#endif
+    for (int i = first_opt; i < argc; i++) {
         if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
         else if (!strcmp(argv[i], "--prompt-file") && i + 1 < argc) prompt_file = argv[++i];
         else if (!strcmp(argv[i], "--raw")) raw = 1;
         else if (!strcmp(argv[i], "--reasoning") && i + 1 < argc) reasoning = argv[++i];
-        else if (!strcmp(argv[i], "--gen") && i + 1 < argc) gen = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--gen") && i + 1 < argc) { gen = atoi(argv[++i]); gen_given = 1; }
         else if (!strcmp(argv[i], "--no-stop")) no_stop = 1;
         else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) {
             const char *v = argv[++i];
@@ -175,6 +283,7 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--prefetch") && i + 1 < argc) prefetch_n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--gpu")) use_gpu = 1;
+        else if (!strcmp(argv[i], "--cpu")) use_gpu = 0;
         else if (!strcmp(argv[i], "--kv") && i + 1 < argc) {
             const char *v = argv[++i];
             if (!strcmp(v, "expanded")) kv_mode = 1;
@@ -188,6 +297,15 @@ int main(int argc, char **argv)
             else if (!strcmp(v, "fp8")) expert_i4 = 0;
             else { fprintf(stderr, "--experts must be fp8 or int4\n"); return 2; }
         }
+        else if (!strcmp(argv[i], "--int4-dir") && i + 1 < argc) { i4_dir = argv[++i]; expert_i4 = 1; }
+        else if (!strcmp(argv[i], "--write-int4") && i + 1 < argc) write_i4 = argv[++i];
+        else if (!strcmp(argv[i], "--verify-int4") && i + 1 < argc) verify_i4 = argv[++i];
+        else if (!strcmp(argv[i], "--i4-layers") && i + 1 < argc) {
+            const char *v = argv[++i];
+            char *end = NULL;
+            i4_from = (int)strtol(v, &end, 10);
+            i4_to = (end && *end == '-') ? atoi(end + 1) : i4_from;
+        }
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
         else if (!strcmp(argv[i], "--tok") && i + 1 < argc) tok_dir = argv[++i];
         else if (!strcmp(argv[i], "--layers") && i + 1 < argc) max_layers = atoi(argv[++i]);
@@ -198,6 +316,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
         else { fprintf(stderr, "unknown or incomplete option %s\n\n", argv[i]); usage(stderr); return 2; }
     }
+    if (write_i4 || verify_i4) return convert_i4(dir, cfg_path, write_i4 ? write_i4 : verify_i4, !write_i4, i4_from, i4_to);
+    glm53f_i4_dir = i4_dir;
     if (!chat && (ids_s != NULL) + (prompt_text != NULL) + (prompt_file != NULL) != 1) {
         fprintf(stderr, "exactly one of --ids, --prompt or --prompt-file is required, "
                         "or --chat for an interactive session\n");
@@ -218,12 +338,15 @@ int main(int argc, char **argv)
     /* ---- interactive session ---- */
     if (chat) {
         const int cap = ctx > 0 ? ctx : (use_gpu ? 2048 : 4096);
+        /* an answer that reasons first needs room: 256 tokens rarely reach the answer */
+        if (!gen_given) gen = 2048;
+        if (gen >= cap) gen = cap / 2;
         Glm53fModel cm;
         Tok ctok;
         /* The session opens with the session, not with a load log. */
         glm53f_quiet = 1;
         const double t_load = now_s();
-        printf("  loading the model…");
+        printf("  loading GLM-5.3-Flash…");
         fflush(stdout);
         glm53f_tok_load(&ctok, tok_dir ? tok_dir : dir);
         if (glm53f_model_open(&cm, dir, cfg_path, cache_gb, max_layers, cap, prefetch_n,
@@ -232,8 +355,7 @@ int main(int argc, char **argv)
         int on_gpu = 0;
         if (use_gpu) {
             on_gpu = glm53f_model_use_gpu(&cm, NULL, 0) == 0;
-            (void)0;
-            if (!on_gpu) printf("NOTE: --gpu requested but the trunk stays on the CPU.\n\n");
+            if (!on_gpu) printf("NOTE: the GPUs are not usable here; the trunk stays on the CPU.\n\n");
         }
         Glm53fChat s;
         memset(&s, 0, sizeof s);
@@ -241,9 +363,8 @@ int main(int argc, char **argv)
         s.reasoning = !strcmp(reasoning, "low") ? "Low" : !strcmp(reasoning, "high") ? "High" : "Max";
         s.gen = gen; s.prefetch = prefetch_n; s.on_gpu = on_gpu; s.cache_gb = (double)cm.cache.nslot * cm.cache.slot_bytes / 1e9;
         s.cache_auto = cache_gb <= 0.0;
-        s.colour = 1;
         s.load_s = now_s() - t_load;
-        printf("\r%*s\r", 24, "");
+        printf("\r%*s\r", 32, "");
         for (int L = 0; L < cm.cfg.n_layers; L++)
             if (glm53f_is_mla(&cm.cfg, L)) s.n_mla++; else s.n_kda++;
         s.ids_cap = GLM53F_MAX_PROMPT;
