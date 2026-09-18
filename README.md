@@ -23,7 +23,7 @@ validated against the official transformers implementation (`modeling_glm5_next.
 Measured on this machine (Ryzen 7 5700X3D, 64 GB RAM, NVMe, Windows 11, MSVC build):
 
 ```console
-$ build/Release/glm53f.exe C:/Users/JoseS/model/GLM-5.3-Flash --prompt-file prompt.txt --gen 400 --cache-gb 30
+$ build/Release/glm53f.exe <model_dir> --prompt-file prompt.txt --gen 400 --cache-gb 30
 ...
 </think>A capital do Brasil é **Brasília**.
 
