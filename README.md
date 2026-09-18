@@ -4,6 +4,11 @@
 
 <h3>GLM-5.3-Flash (~314B total, ~18B active) in portable C. One CPU, no framework.</h3>
 
+<img src="docs/media/demo.gif" width="760" alt="localcode answering in the terminal: GLM-5.3-Flash running locally">
+
+<sub><code>localcode</code>, the interactive session: the 314B checkpoint on a PC with 64 GB of RAM and
+two RTX 3060, at 1.10 s/token with the int4 container.</sub>
+
 </div>
 
 ## Status
