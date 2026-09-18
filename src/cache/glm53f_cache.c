@@ -7,8 +7,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 #include "glm53f_cache.h"
+#include "glm53f_i4file.h"
 
 static double now_s(void)
 {
@@ -92,11 +96,21 @@ static void land(Glm53fCache *c, int32_t key, int slot, const Glm53fExpertRef *r
     pthread_cond_broadcast(&c->landed);
 }
 
-/* Read one expert into a reserved slot. Called WITHOUT mu. */
-static int load_into(Glm53fCache *c, int layer, int expert, int slot, Glm53fExpertRef *r, int64_t *pad)
+/* Read one expert into a reserved slot; *nread receives the bytes it cost. Called WITHOUT mu. */
+static int load_into(Glm53fCache *c, int layer, int expert, int slot, Glm53fExpertRef *r, int64_t *pad,
+                     int64_t *nread)
 {
     *pad = 0;
+    *nread = 0;
     if (glm53f_expert_ref(c->st, c->cfg, layer, expert, r) != 0) return 0;
+    if (c->i4_fd && c->i4_fd[layer] >= 0) {      /* the int4 container: one read, no arithmetic */
+        const int64_t off = glm53f_i4file_offset(expert, c->slot_bytes);
+        const int ok = pread(c->i4_fd[layer], c->arena + (size_t)slot * c->slot_bytes,
+                             (size_t)c->slot_bytes, off) == (ssize_t)c->slot_bytes;
+        *nread = c->slot_bytes;
+        return ok;
+    }
+    *nread = r->w_bytes + r->s_bytes;
     const int64_t need = c->i4 ? glm53f_expert_i4_slot_bytes(r) : glm53f_expert_slot_bytes(r);
     if (need > c->slot_bytes) {
         fprintf(stderr, "glm53f_cache: L%d expert %d needs %lld bytes, slot holds %lld\n",
@@ -153,8 +167,8 @@ static int cache_get(Glm53fExpertSrc *self, int layer, int expert, Glm53fExpertQ
         }
         pthread_mutex_unlock(&c->mu);
         Glm53fExpertRef r;
-        int64_t pad;
-        const int ok = load_into(c, layer, expert, slot, &r, &pad);
+        int64_t pad, nread;
+        const int ok = load_into(c, layer, expert, slot, &r, &pad, &nread);
         pthread_mutex_lock(&c->mu);
         land(c, key, slot, &r, pad, ok, 0);
         if (!ok) {
@@ -163,7 +177,7 @@ static int cache_get(Glm53fExpertSrc *self, int layer, int expert, Glm53fExpertQ
             c->load_seconds += now_s() - t0;
             return -1;
         }
-        c->bytes_read += (uint64_t)(r.w_bytes + r.s_bytes);
+        c->bytes_read += (uint64_t)nread;
         /* loop: the slot is now resident and the hit path pins it */
         c->hits--;
     }
@@ -184,7 +198,7 @@ static void cache_release(Glm53fExpertSrc *self, int layer, int expert)
 static int cache_getmany(Glm53fExpertSrc *self, int layer, const int *ids, int n)
 {
     Glm53fCache *c = (Glm53fCache *)self;
-    typedef struct { int slot, expert, ok; int32_t key; Glm53fExpertRef r; int64_t pad; } Work;
+    typedef struct { int slot, expert, ok; int32_t key; Glm53fExpertRef r; int64_t pad, nread; } Work;
     Work w[GLM53F_MAX_TOPK];
     int nw = 0;
 
@@ -208,7 +222,7 @@ static int cache_getmany(Glm53fExpertSrc *self, int layer, const int *ids, int n
 #   pragma omp parallel for schedule(dynamic, 1)
 #endif
     for (i = 0; i < nw; i++)
-        w[i].ok = load_into(c, layer, w[i].expert, w[i].slot, &w[i].r, &w[i].pad);
+        w[i].ok = load_into(c, layer, w[i].expert, w[i].slot, &w[i].r, &w[i].pad, &w[i].nread);
 
     int ok = 0;
     pthread_mutex_lock(&c->mu);
@@ -219,7 +233,7 @@ static int cache_getmany(Glm53fExpertSrc *self, int layer, const int *ids, int n
                     layer, w[k].expert);
             continue;
         }
-        c->bytes_read += (uint64_t)(w[k].r.w_bytes + w[k].r.s_bytes);
+        c->bytes_read += (uint64_t)w[k].nread;
         c->prefetch_reads++;
         ok++;
     }
@@ -292,12 +306,12 @@ static void *io_main(void *arg)
         pthread_mutex_unlock(&c->mu);
 
         Glm53fExpertRef r;
-        int64_t pad;
-        const int ok = load_into(c, key / c->n_experts, key % c->n_experts, slot, &r, &pad);
+        int64_t pad, nread;
+        const int ok = load_into(c, key / c->n_experts, key % c->n_experts, slot, &r, &pad, &nread);
 
         pthread_mutex_lock(&c->mu);
         land(c, key, slot, &r, pad, ok, 1);
-        if (ok) { c->bg_reads++; c->bg_bytes += (uint64_t)(r.w_bytes + r.s_bytes); }
+        if (ok) { c->bg_reads++; c->bg_bytes += (uint64_t)nread; }
     }
     pthread_mutex_unlock(&c->mu);
     return NULL;
@@ -345,6 +359,23 @@ int glm53f_cache_init(Glm53fCache *c, const Glm53fSt *st, const Glm53fCfg *cfg,
     if (posix_memalign((void **)&c->arena, GLM53F_ST_ALIGN, want) != 0) {
         fprintf(stderr, "glm53f_cache: cannot allocate %.2f GB arena\n", (double)want / 1e9);
         return -1;
+    }
+    if (c->i4 && glm53f_i4_dir) {
+        c->i4_fd = (int *)malloc((size_t)c->n_layers * sizeof(int));
+        if (!c->i4_fd) return -1;
+        for (int L = 0; L < c->n_layers; L++) {
+            c->i4_fd[L] = -1;
+            if (L >= cfg->n_layers || glm53f_is_dense(cfg, L)) continue;
+            const int fd = glm53f_i4file_open_layer(st, cfg, L, glm53f_i4_dir);
+            Glm53fExpertRef lr;
+            if (fd >= 0 && (glm53f_expert_ref(st, cfg, L, 0, &lr) != 0 ||
+                            glm53f_expert_i4_slot_bytes(&lr) != c->slot_bytes)) {
+                fprintf(stderr, "glm53f_cache: layer %d of the int4 container has another expert size\n", L);
+                close(fd);
+                continue;
+            }
+            if (fd >= 0) { c->i4_fd[L] = fd; c->i4_layers++; }
+        }
     }
     if (c->i4) {
         c->nstage = n_io > 0 ? n_io + 1 : 4;
@@ -400,6 +431,8 @@ void glm53f_cache_free(Glm53fCache *c)
         for (int i = 0; i < c->n_io; i++) pthread_join(c->io[i], NULL);
     }
     free(c->io);
+    if (c->i4_fd) for (int L = 0; L < c->n_layers; L++) if (c->i4_fd[L] >= 0) close(c->i4_fd[L]);
+    free(c->i4_fd);
     if (c->slot_of || c->arena) {
         pthread_cond_destroy(&c->stage_free);
         pthread_cond_destroy(&c->work);

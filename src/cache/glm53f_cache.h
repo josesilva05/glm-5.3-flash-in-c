@@ -60,6 +60,10 @@ typedef struct {
     unsigned char *stage_busy;
     int          nstage;
     pthread_cond_t stage_free;
+    /* --int4-dir: per layer, a descriptor of its container file (read straight into the
+     * slot) or -1 (quantised on the way in); NULL without a container */
+    int         *i4_fd;
+    int          i4_layers;
 
     int32_t     *slot_of;         /* [n_layers*n_experts] -> resident slot, or -1  */
     int32_t     *inflight_of;     /* [n_layers*n_experts] -> slot being read, or -1 */

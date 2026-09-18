@@ -40,7 +40,7 @@ INCLUDES := -Iinclude -Iinclude/glm53f -Ithird_party \
             -Isrc/core -Isrc/io -Isrc/cache -Isrc/model -Isrc/tokenizer
 
 ENGINE_SRC := src/core/glm53f_ops.c src/core/glm53f_dsa.c src/io/glm53f_st.c \
-              src/io/glm53f_load.c src/cache/glm53f_cache.c src/model/glm53f_bind.c \
+              src/io/glm53f_load.c src/io/glm53f_i4file.c src/cache/glm53f_cache.c src/model/glm53f_bind.c \
               src/model/glm53f_model.c src/model/glm53f_mtp.c
 ENGINE_OBJ := $(patsubst %.c,$(BUILD)/%.o,$(ENGINE_SRC))
 
@@ -49,15 +49,19 @@ FIX   ?= tests/fixtures
 
 .PHONY: all test portable clean
 
-all: $(BIN)/glm53f
+all: $(BIN)/glm53f $(BIN)/localcode
 
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(BIN)/glm53f: src/cli/glm53f_run.c src/cli/glm53f_chat.c $(ENGINE_OBJ)
+$(BIN)/glm53f: src/cli/glm53f_run.c src/cli/glm53f_chat.c src/cli/glm53f_tui.c $(ENGINE_OBJ)
 	@mkdir -p $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+$(BIN)/localcode: src/cli/glm53f_run.c src/cli/glm53f_chat.c src/cli/glm53f_tui.c $(ENGINE_OBJ)
+	@mkdir -p $(BIN)
+	$(CC) $(CFLAGS) -DGLM53F_LOCALCODE=1 $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_%: tests/unit/test_%.c $(ENGINE_OBJ)
 	@mkdir -p $(BIN)

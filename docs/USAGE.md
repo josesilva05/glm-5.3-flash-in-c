@@ -61,6 +61,7 @@ answer. Generation stops at an EOS token from the config (`<|endoftext|>`, `<|us
 | `--cache-gb X\|auto` | routed-expert cache in GB. `auto` (default) takes the RAM free when the model opens, minus what the session needs (attention caches, indexer, work buffers) and a fifth of the installed RAM kept for the system; the size used is printed. With `--gpu` the trunk's RAM counts as free |
 | `--kv auto\|expanded\|compressed` | how the MLA cache stores a position: expanded keys and values (1.44 MB per position) or the `kv_lora` latent (22 KB, expanded once per query, ARCHITECTURE.md 2.7). `auto` (default) uses compressed past 2051 positions, where the expanded cache no longer fits |
 | `--experts fp8\|int4` | `fp8` (default) multiplies the checkpoint's own expert weights. `int4` re-quantises them inside the cache (1.8x more experts in the same RAM, ~13% faster decode) and makes the output an approximation of the model, not the model |
+| `--int4-dir DIR` | read the routed experts from an int4 container written by `--write-int4` (below): 14.2 MB per read instead of 25.2 MB, bit-identical to `--experts int4` and like it an approximation of the checkpoint. Implies `--experts int4`; layers missing from the container are quantised on the way in |
 | `--gpu` | run the trunk (attention, mHC, dense and shared-expert MLPs, lm_head) on all CUDA devices; routed experts stay on the CPU. Needs a `-DGLM53F_CUDA=ON` build. Falls back to the CPU with a message if there is no device or the trunk does not fit. The host copy of the trunk is then freed, so raise `--cache-gb` by ~13 GB (see below) |
 | `--prefetch N` | predictive expert prefetch in prefill and decode: background readers fetch each MoE layer's experts and the N most likely experts of the next layer (per token) while compute continues (default 6, `0` = off; output is identical either way). `GLM53F_IO_THREADS` sets the reader count (default 2). With `--gpu`, where compute is faster, `--prefetch 4` measured marginally better (PERFORMANCE.md) |
 | `--config PATH` | config file (default `<model_dir>/config.json`) |
@@ -69,7 +70,7 @@ answer. Generation stops at an EOS token from the config (`<|endoftext|>`, `<|us
 | `--dump-logits PATH` | float32 logits of the prompt's last position |
 | `--out FILE` | JSON report (default `glm53f_run.json`) |
 | `--quiet` | stream the text instead of the per-step table |
-| `--chat` | interactive session (below); takes no prompt |
+| `--chat` | interactive session, as `localcode` (below); takes no prompt |
 | `--ctx N` | positions an interactive session may hold (default 2048, 4096 without `--gpu`) |
 
 Limits: prompt + generated tokens <= 32,768 (`--gpu` handles up to 2051, the range where
@@ -77,26 +78,74 @@ dense attention equals the model's sparse attention); `--gen` <= 8192. Past 2051
 the KV cache switches to the compressed form (22 KB per position instead of 1.44 MB), so
 an 8k session holds ~180 MB of it and a 32k session ~0.7 GB.
 
-### Interactive session (`--chat`)
+### The int4 expert container
 
 ```bash
-build/Release/glm53f <model_dir> --chat --gpu
+build/Release/glm53f <model_dir> --write-int4 <container_dir>            # all 42 MoE layers, ~171 GB
+build/Release/glm53f <model_dir> --write-int4 <container_dir> --i4-layers 3-27
+build/Release/glm53f <model_dir> --verify-int4 <container_dir>
+build/Release/localcode <model_dir> --int4-dir <container_dir>
 ```
+
+The container holds the routed experts already quantised to int4, one file per MoE layer
+(4.08 GB each). Reading a layer's experts from it costs 44% fewer bytes than the FP8
+checkpoint and no arithmetic, which is what sets decode speed (PERFORMANCE.md). The
+checkpoint is never changed, and a run without `--int4-dir` is the exact model again.
+
+Writing is resumable: a layer already complete is skipped, and a stopped conversion leaves
+a `.part` file that is never used. Each file carries a fingerprint of the checkpoint it came
+from (a container from another checkpoint is refused) and a CRC per expert, which
+`--verify-int4` checks. A partial container works: its layers are read from it, the others
+quantised on the way in. Writing reads the FP8 experts at full speed; a drive without a
+heatsink or with a small SLC cache can slow down after tens of GB.
+
+### localcode: the interactive session
+
+```bash
+build/Release/localcode <model_dir>
+```
+
+`localcode` is the same program opening straight into a conversation, on the GPUs when the
+build has CUDA (`--cpu` keeps the trunk on the CPU). The model directory can also come from
+`LOCALCODE_MODEL`. `glm53f <model_dir> --chat --gpu` is the same session.
 
 The model stays loaded between messages, and each turn feeds only its new tokens: what the
 earlier turns left in the KV cache, the KDA state and the indexer is reused, so a follow-up
-question does not re-read the conversation. The reasoning is shown dimmed, the answer after
-a `── resposta ──` separator, and each turn ends with a line of numbers (tokens generated,
-s/token, tokens read, context used, why it stopped).
+question does not re-read the conversation.
+
+On a terminal it takes the whole window, in the layout of terminal coding tools and a green
+palette: the conversation scrolls above an input box that stays at the bottom, with a footer
+showing the working directory and the context used. The reasoning is folded into one live
+line (`Thinking · 42 tokens · 38s`, then `+ Thought: 81s`), the answer's Markdown is
+rendered as it streams, and each answer ends with its tokens, s/token and time. The model
+runs on its own thread, so the screen stays responsive while it works. Answers may run to
+2048 tokens (`--gen`).
+
+| key | effect |
+|---|---|
+| enter | send the message; while an answer is being written it waits in a queue |
+| esc, ctrl+c | stop the answer being written (the conversation keeps what was written) |
+| ctrl+c on an empty box, ctrl+d | leave |
+| pgup, pgdn, mouse wheel | scroll the conversation; end follows it again |
+| up, down | earlier messages |
+| left, right, home, end, ctrl+a, ctrl+e, ctrl+u, ctrl+w | edit the message |
+| paste | text with line breaks stays one message |
 
 | command | effect |
 |---|---|
-| `/reset` | forget the conversation and start a new one |
-| `/params` | the settings in force and the context used |
+| `/file PATH [question]` | send a file's text followed by the question; a path with spaces goes in quotes |
+| `/reset` (`/new`, `/clear`) | forget the conversation and start a new one |
+| `/save [FILE]` | write the conversation as Markdown: each message, the reasoning in a folded `<details>` block, the answer and its numbers (default `glm53f-chat-YYYYMMDD-HHMMSS.md`) |
+| `/thinking` | show the reasoning as it is written, or fold it again |
+| `/reasoning max\|high\|low` | Reasoning Effort for the following turns |
 | `/gen N` | tokens to generate per answer |
-| `/reasoning max\|high\|low` | Reasoning Effort for the next conversation turns |
-| `/save [FILE]` | write the conversation as Markdown: each message, the reasoning in a folded `<details>` block, the answer and its numbers (default `glm53f-chat-YYYYMMDD-HHMMSS.md` in the current directory) |
+| `/params` | the settings in force and the context used |
 | `/help`, `/quit` | |
+
+When input or output is not a terminal (a pipe, a captured session) the session runs line
+by line without colour. `LOCALCODE_PLAIN=1` (or `NO_COLOR`) asks for that mode on a terminal
+too; `LOCALCODE_TUI=1` forces the full screen, sized by `COLUMNS` and `LINES`, which is how
+the screen is tested from a script.
 
 ### Output
 
@@ -128,6 +177,7 @@ cache report. The JSON report holds prompt ids, generated ids and text, and the 
 | `GLM53F_MTP_STATS=1` | bind the checkpoint's MTP layer, draft a token per decode step and report how often the draft equals the token the model produced (CPU path only; does not change the output) |
 | `GLM53F_CHUNK=N` | positions per prefill chunk (default 256); the output does not depend on it |
 | `GLM53F_SPAN=N` | positions a prefill takes layer by layer at once (default 4096, ARCHITECTURE.md 2.3); the output does not depend on it |
+| `GLM53F_IO_PRIORITY=low` | (Windows) mark the checkpoint's reads low priority, so the system and other programs, including the page file on the same drive, go first and the machine stays responsive while the model reads. Off by default: Windows also slows low-priority reads on an idle drive, and decode measured 13% slower (PERFORMANCE.md) |
 | `GLM53F_ROUTE_TRACE=path` | append one line per decode MoE layer: layer, the 8 routed experts, microseconds waiting for reads, microseconds computing |
 
 ## GPU environment variables

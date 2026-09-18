@@ -74,10 +74,12 @@ build/Release/glm53f <model_dir> --prompt-file prompt.txt --gen 400 --quiet
 ```
 
 The expert cache is sized from the free RAM unless `--cache-gb` is given. For a conversation
-that keeps the model loaded between messages (`/save` writes it as Markdown):
+that keeps the model loaded between messages, `localcode` opens a terminal chat in the
+style of terminal coding tools (green theme, folded reasoning, rendered Markdown, `/file`,
+`/save`):
 
 ```bash
-build/Release/glm53f <model_dir> --chat --gpu
+build/Release/localcode <model_dir>
 ```
 
 With NVIDIA GPUs:

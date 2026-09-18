@@ -22,6 +22,7 @@ compile_commands.json
 # directory is ignored while an identically-named fixture is not.
 /*.log
 /glm53f_run.json
+/glm53f-chat-*.md
 /st_index.json
 /st_values.json
 /out/

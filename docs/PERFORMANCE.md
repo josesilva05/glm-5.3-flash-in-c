@@ -140,6 +140,50 @@ the next layer only when the cache holds two layers' experts (576 slots, 14.5 GB
 | chunk by chunk | 20.5 s, 46.2 GB | 18.1 s, 40.4 GB |
 | layer by layer | 14.2 s, 21.7 GB | 11.7 s, 21.7 GB |
 
+## The int4 container and the drive's temperature
+
+`--int4-dir` reads experts already quantised to int4 (USAGE.md). Checked first on 6 layers
+(`--gpu`, the 372-token document): the logits are byte-identical to `--experts int4`
+quantising on the way in, and the experts read fall from 21.70 to 12.20 GB (-44%), the
+prefill from 14.1 to 9.6 s.
+
+In `localcode` with `--gpu`, a container holding 25 of the 42 MoE layers (3-27; the rest
+quantised on the way in, because the drive had no room for more), cache sized
+automatically (37.8 GB, 2,671 experts), reasoning Max:
+
+| mode | s/token | drive temperature during a long answer |
+|---|---|---|
+| FP8, exact (the checkpoint) | 1.77 with the drive cool; ~5 once it reaches 78 °C | climbed to 78 °C and held there |
+| `--experts int4`, no container (earlier, 44 GB cache) | 1.49 | - |
+| **int4 container, 25 of 42 layers** | **1.12, 1.17** (two answers, 148 and 242 tokens) | **stayed at or below 70 °C** |
+
+Two effects add up. Fewer bytes per token is the direct one. The other is thermal: this
+drive (an OEM PCIe 4.0 NVMe without a heatsink) reads the exact model continuously, climbs
+to 78 °C within minutes and then holds that temperature by reading slower, which took the
+exact path from 1.8 to ~5 s/token in a long answer. Reading 44% less, it stayed below 70 °C.
+With the container the drive is no longer the busiest part: the task manager showed the
+disk at 68-91% and the CPU at 78-89% during decode, so int4 expert compute is the next
+limit.
+
+The first ~13 layers of the conversion took 15-20 s each; after about 40 GB written in a
+row the drive slowed to 50-136 s per layer, its write cache exhausted, which only affects
+writing the container.
+
+## Low I/O priority (`GLM53F_IO_PRIORITY=low`, not adopted as default)
+
+Marking the checkpoint's reads low priority lets the system and other programs use the
+drive first, which keeps the machine responsive while the exact path reads continuously.
+Interleaved runs, FP8 exact, `--gpu --cache-gb 36`, 40 tokens, identical tokens throughout:
+
+| priority | decode s/token | waiting on reads | read per token |
+|---|---|---|---|
+| low | 2.83, 2.66 | 2.16, 2.02 s | 4.31, 4.32 GB |
+| normal (default) | **2.44, 2.35** | 1.76, 1.69 s | 4.34, 4.35 GB |
+
+Windows slows low-priority reads even when nothing else uses the drive, so the option stays
+opt-in. (These runs are slower than earlier ones because the drive was 98% full and warm;
+only the interleaved comparison is meaningful.)
+
 ## CUDA backend (`--gpu`)
 
 The trunk runs on the two GPUs, routed experts on the CPU (ARCHITECTURE.md 2.6). 40
