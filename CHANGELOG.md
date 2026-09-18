@@ -5,6 +5,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-09-17
+
+Everything since the first version that ran the released checkpoint: the interactive
+session became a program of its own (`localcode`), the trunk runs on the GPUs, a prompt
+is read layer by layer, and the routed experts can come from an int4 container on disk.
+The exact path is still the default and still matches the reference.
+
+Known limits of this version: the full-screen session has been exercised on Windows
+Terminal, while its POSIX path (termios, VT input) compiles but has not been run on a
+Linux terminal; the int4 container has been measured with 25 of the 42 MoE layers
+converted; and every number below comes from one machine (Ryzen 7 5700X3D, 64 GB,
+2x RTX 3060, one NVMe).
+
 ### Added
 
 - int4 expert container: `--write-int4 DIR` quantises the routed experts into one file per
