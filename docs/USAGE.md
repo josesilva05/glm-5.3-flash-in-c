@@ -107,7 +107,11 @@ build/Release/localcode <model_dir>
 
 `localcode` is the same program opening straight into a conversation, on the GPUs when the
 build has CUDA (`--cpu` keeps the trunk on the CPU). The model directory can also come from
-`LOCALCODE_MODEL`. `glm53f <model_dir> --chat --gpu` is the same session.
+`LOCALCODE_MODEL`. `glm53f <model_dir> --chat --gpu` is the same session. On Windows,
+`start.bat` at the repository root opens it with a double-click: the model directory comes
+from its first argument, `LOCALCODE_MODEL` or `%USERPROFILE%\model\GLM-5.3-Flash` (it asks
+if none has a `config.json`), `LOCALCODE_INT4` adds `--int4-dir`, and other arguments go to
+`localcode` as they are.
 
 The model stays loaded between messages, and each turn feeds only its new tokens: what the
 earlier turns left in the KV cache, the KDA state and the indexer is reused, so a follow-up
@@ -139,8 +143,21 @@ runs on its own thread, so the screen stays responsive while it works. Answers m
 | `/thinking` | show the reasoning as it is written, or fold it again |
 | `/reasoning max\|high\|low` | Reasoning Effort for the following turns |
 | `/gen N` | tokens to generate per answer |
+| `/stats` | what this session measured: tokens written and s/token (with a bar per answer), prompt reading speed, experts per token split into from RAM / read ahead from the SSD / read on demand, GB read per token, the share of a token spent waiting on the disk, and which of disk or compute is the limit |
+| `/copy` | put the last answer, without its reasoning, on the clipboard (Windows clipboard; OSC 52 elsewhere) |
 | `/params` | the settings in force and the context used |
 | `/help`, `/quit` | |
+
+Typing `/` opens a menu above the input box, filtered as you type (by prefix, then by the
+letters in order). Each command shows where its setting stands (`Low`, `2048`, `folded`,
+the context left), and the header shows the last answer's s/token. After a command that
+takes a value the menu lists the values: `/reasoning ` the three efforts, `/gen ` answer
+lengths with the time each would take at the last answer's measured s/token (and a warning
+past the context left), `/file ` the files of a directory with their size and an estimate
+of the tokens they would take (about 3.5 bytes per token) against the positions left.
+Folders open in place. Up and down choose (shift+tab goes back), tab completes, enter runs a
+command or completes a path, esc closes the menu (a second esc stops an answer); `/gen 300`
+followed by enter sends the number as typed.
 
 When input or output is not a terminal (a pipe, a captured session) the session runs line
 by line without colour. `LOCALCODE_PLAIN=1` (or `NO_COLOR`) asks for that mode on a terminal

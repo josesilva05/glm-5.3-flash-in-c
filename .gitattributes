@@ -24,3 +24,6 @@ tests/fixtures/**/*.bin         -text
 # Collapse generated artefacts in pull-request diffs. They stay in the repository and are
 # still versioned; this only stops them dominating the review.
 docs/images/*.png linguist-generated=true
+
+# cmd.exe needs CRLF: with LF, labels and goto misbehave.
+*.bat   text eol=crlf

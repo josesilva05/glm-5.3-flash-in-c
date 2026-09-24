@@ -136,18 +136,148 @@ static char *save(Glm53fChat *s, const char *arg)
 
 /* ------------------------------------------------------------------- commands ---- */
 
-static const char HELP[] =
-    "/file PATH [question]   send a file's text, then the question (a path with spaces in quotes)\n"
-    "/reset                  forget the conversation and start a new one\n"
-    "/save [FILE]            write the conversation as Markdown (default glm53f-chat-DATE.md)\n"
-    "/thinking               show or fold the model's reasoning\n"
-    "/reasoning max|high|low Reasoning Effort for the next turns\n"
-    "/gen N                  tokens to generate per answer\n"
-    "/params                 the settings in force\n"
-    "/quit                   leave\n"
+const Glm53fCommand glm53f_commands[] = {
+    { "/file",      "PATH [question]", "send a file's text, then the question (a path with spaces in quotes)", 2 },
+    { "/reasoning", "max|high|low",    "Reasoning Effort for the next turns", 2 },
+    { "/gen",       "N",               "tokens to generate per answer", 2 },
+    { "/thinking",  "",                "show or fold the model's reasoning", 0 },
+    { "/stats",     "",                "measured speed, disk reads and expert cache of this session", 0 },
+    { "/params",    "",                "the settings in force", 0 },
+    { "/copy",      "",                "put the last answer on the clipboard", 0 },
+    { "/save",      "[FILE]",          "write the conversation as Markdown (default glm53f-chat-DATE.md)", 1 },
+    { "/reset",     "",                "forget the conversation and start a new one", 0 },
+    { "/help",      "",                "the commands and keys", 0 },
+    { "/quit",      "",                "leave", 0 },
+};
+const int glm53f_ncommands = (int)(sizeof glm53f_commands / sizeof *glm53f_commands);
+
+static const char KEYS[] =
+    "/ opens the menu: up, down to choose, tab to complete, enter to run, esc to close\n"
     "esc, ctrl+c             stop the answer being written; ctrl+c on an empty box leaves\n"
     "pgup, pgdn, wheel       scroll the conversation; end follows it again\n"
     "up, down                earlier messages";
+
+static char *help_note(void)
+{
+    char buf[3072];
+    int n = 0;
+    for (int i = 0; i < glm53f_ncommands && n < (int)sizeof buf; i++) {
+        const Glm53fCommand *c = &glm53f_commands[i];
+        char head[64];
+        snprintf(head, sizeof head, "%s%s%s", c->name, *c->args ? " " : "", c->args);
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "%-24s %s\n", head, c->help);
+    }
+    if (n < (int)sizeof buf) snprintf(buf + n, sizeof buf - (size_t)n, "%s", KEYS);
+    return dup_str(buf);
+}
+
+void glm53f_chat_command_value(const Glm53fChat *s, const Glm53fCommand *c, char *buf, size_t cap)
+{
+    const char *n = c->name;
+    buf[0] = 0;
+    if (!strcmp(n, "/reasoning"))     snprintf(buf, cap, "%s", s->reasoning);
+    else if (!strcmp(n, "/gen"))      snprintf(buf, cap, "%d", s->gen);
+    else if (!strcmp(n, "/thinking")) snprintf(buf, cap, "%s", s->show_thinking ? "shown" : "folded");
+    else if (!strcmp(n, "/stats") && s->last_spt > 0.0) snprintf(buf, cap, "%.2f s/token", s->last_spt);
+    else if (!strcmp(n, "/copy"))     snprintf(buf, cap, "%s", s->last_answer ? "last answer" : "nothing yet");
+    else if (!strcmp(n, "/save") && s->log_len) snprintf(buf, cap, "%.1f KB", (double)s->log_len / 1024.0);
+    else if (!strcmp(n, "/reset"))    snprintf(buf, cap, "%d/%d", s->m->cached, s->m->cap);
+    else if (!strcmp(n, "/file"))     snprintf(buf, cap, "%d left", s->m->cap - s->m->cached);
+}
+
+/* A bar per answer, higher is slower: how the speed moved as the cache warmed up. */
+static void spark(const Glm53fChat *s, char *buf, size_t cap)
+{
+    static const char *bars[] = { "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
+    double lo = 1e30, hi = 0.0;
+    for (int i = 0; i < s->n_spt; i++) {
+        if (s->spt_hist[i] < lo) lo = s->spt_hist[i];
+        if (s->spt_hist[i] > hi) hi = s->spt_hist[i];
+    }
+    size_t n = 0;
+    buf[0] = 0;
+    for (int i = 0; i < s->n_spt && n + 4 < cap; i++) {
+        const int k = hi > lo ? (int)(7.0 * (s->spt_hist[i] - lo) / (hi - lo) + 0.5) : 3;
+        n += (size_t)snprintf(buf + n, cap - n, "%s", bars[k]);
+    }
+}
+
+static char *stats_note(const Glm53fChat *s)
+{
+    const Glm53fCache *c = &s->m->cache;
+    char buf[1600], d1[32], d2[32], sp[80];
+    int n = 0;
+    if (!s->dec_tok) {
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "nothing measured yet: the first answer fills this in\n");
+    } else {
+        const double spt = s->dec_s / (double)s->dec_tok;
+        duration(d1, sizeof d1, s->dec_s);
+        duration(d2, sizeof d2, s->pre_s);
+        spark(s, sp, sizeof sp);
+        n += snprintf(buf + n, sizeof buf - (size_t)n,
+                      "writing   %ld tokens in %s over %d answer%s · %.2f s/token (%.2f tokens/s) %s\n",
+                      s->dec_tok, d1, s->turns, s->turns == 1 ? "" : "s", spt, 1.0 / spt, sp);
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "reading   %ld prompt tokens in %s · %.2f s/token\n",
+                      s->pre_tok, d2, s->pre_tok ? s->pre_s / (double)s->pre_tok : 0.0);
+        const double wait = s->dec_wait_s / (double)s->dec_tok;
+        const double reqs = s->dec_reqs ? (double)s->dec_reqs : 1.0;
+        const double ahead = (double)s->dec_ahead, demand = (double)s->dec_demand;
+        const double ram = reqs - ahead - demand > 0.0 ? reqs - ahead - demand : 0.0;
+        n += snprintf(buf + n, sizeof buf - (size_t)n,
+                      "experts   %.0f per token: %.0f%% from RAM, %.0f%% read ahead from the SSD, "
+                      "%.0f%% read on demand · %.2f GB read per token\n",
+                      (double)s->dec_reqs / (double)s->dec_tok, 100.0 * ram / reqs, 100.0 * ahead / reqs,
+                      100.0 * demand / reqs, s->dec_read_gb / (double)s->dec_tok);
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "waiting   %.2f s/token on the disk, %.0f%% of a token\n",
+                      wait, spt > 0.0 ? 100.0 * wait / spt : 0.0);
+        /* the finding the engine is built around (PERFORMANCE.md): decode time follows bytes read */
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "limit     %s\n",
+                      wait > 0.5 * spt ? "the disk: tokens go as fast as experts arrive; more cache or int4 experts read less"
+                                       : "compute: the experts mostly come from RAM");
+    }
+    snprintf(buf + n, sizeof buf - (size_t)n,
+             "engine    cache %.1f GB, %d experts %s · prefetch %d · trunk on %s · context %d of %d",
+             s->cache_gb, c->nslot, c->i4 ? "int4 (approximate)" : "fp8 (exact)", s->prefetch,
+             s->on_gpu ? "the gpus" : "the cpu", s->m->cached, s->m->cap);
+    return dup_str(buf);
+}
+
+/* The clipboard: the Windows one, or OSC 52, which most terminals pass to theirs. */
+static char *copy_answer(const Glm53fChat *s)
+{
+    if (!s->last_answer || !*s->last_answer) return dup_str("no answer to copy yet");
+    const char *t = s->last_answer;
+    const size_t n = strlen(t);
+#ifdef _WIN32
+    const int wn = MultiByteToWideChar(CP_UTF8, 0, t, (int)n, NULL, 0);
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, ((size_t)wn + 1) * sizeof(wchar_t));
+    if (!h) return dup_str("could not copy: out of memory");
+    wchar_t *w = (wchar_t *)GlobalLock(h);
+    MultiByteToWideChar(CP_UTF8, 0, t, (int)n, w, wn);
+    w[wn] = 0;
+    GlobalUnlock(h);
+    if (!OpenClipboard(NULL)) { GlobalFree(h); return dup_str("could not open the clipboard"); }
+    EmptyClipboard();
+    if (!SetClipboardData(CF_UNICODETEXT, h)) { CloseClipboard(); GlobalFree(h); return dup_str("could not copy"); }
+    CloseClipboard();
+#else
+    static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    fputs("\033]52;c;", stdout);
+    for (size_t i = 0; i < n; i += 3) {
+        const unsigned v = (unsigned)(unsigned char)t[i] << 16 |
+                           (i + 1 < n ? (unsigned)(unsigned char)t[i + 1] << 8 : 0) |
+                           (i + 2 < n ? (unsigned)(unsigned char)t[i + 2] : 0);
+        const char q[4] = { b64[v >> 18 & 63], b64[v >> 12 & 63],
+                            i + 1 < n ? b64[v >> 6 & 63] : '=', i + 2 < n ? b64[v & 63] : '=' };
+        fwrite(q, 1, 4, stdout);
+    }
+    fputs("\a", stdout);
+    fflush(stdout);
+#endif
+    char msg[96];
+    snprintf(msg, sizeof msg, "copied the last answer (%zu byte%s)", n, n == 1 ? "" : "s");
+    return dup_str(msg);
+}
 
 static char *params_note(const Glm53fChat *s)
 {
@@ -191,7 +321,11 @@ void glm53f_chat_input(Glm53fChat *s, const char *raw, Glm53fInput *in)
     if (!strcmp(line, "/quit") || !strcmp(line, "/exit")) {
         in->kind = GLM53F_IN_QUIT;
     } else if (!strcmp(line, "/help")) {
-        in->note = dup_str(HELP);
+        in->note = help_note();
+    } else if (!strcmp(line, "/stats")) {
+        in->note = stats_note(s);
+    } else if (!strcmp(line, "/copy")) {
+        in->note = copy_answer(s);
     } else if (!strcmp(line, "/params")) {
         in->note = params_note(s);
     } else if (!strcmp(line, "/thinking")) {
@@ -262,6 +396,20 @@ void glm53f_chat_gauge(const Glm53fChat *s, char *buf, size_t cap)
 
 /* ----------------------------------------------------------------------- turn ---- */
 
+/* The expert cache's counters at one moment (they only grow in a session). */
+typedef struct { uint64_t hits, misses, ahead, bytes; double wait; } CacheSnap;
+
+static void cache_snap(Glm53fCache *c, CacheSnap *o)
+{
+    pthread_mutex_lock(&c->mu);
+    o->hits = c->hits;
+    o->misses = c->misses;
+    o->ahead = c->prefetch_reads + c->bg_used;   /* hits that the disk delivered just before */
+    o->bytes = c->bytes_read + c->bg_bytes;
+    o->wait = c->load_seconds;
+    pthread_mutex_unlock(&c->mu);
+}
+
 static volatile sig_atomic_t g_stop = 0;
 
 void glm53f_chat_stop(void) { g_stop = 1; }
@@ -306,6 +454,8 @@ int glm53f_chat_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
     k->status(k, NULL, 0.0);
 
     int nout = 0, printed = 0, stopped = 0, in_think = 1, interrupted = 0;
+    CacheSnap c0, c1;
+    cache_snap(&m->cache, &c0);
     const double td = now_s();
     for (int step = 0; step < s->gen; step++) {
         if (g_stop) { interrupted = 1; break; }
@@ -347,6 +497,24 @@ int glm53f_chat_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
     }
     k->status(k, NULL, 0.0);
     const double t_dec = now_s() - td;
+    cache_snap(&m->cache, &c1);
+
+    s->turns++;
+    s->pre_tok += n;
+    s->pre_s += t_prefill;
+    if (nout) {
+        s->dec_tok += nout;
+        s->dec_s += t_dec;
+        s->dec_wait_s += c1.wait - c0.wait;
+        s->dec_read_gb += (double)(c1.bytes - c0.bytes) / 1e9;
+        const uint64_t hits = c1.hits - c0.hits, ahead = c1.ahead - c0.ahead;
+        s->dec_ahead += ahead < hits ? ahead : hits;
+        s->dec_demand += c1.misses - c0.misses;
+        s->dec_reqs += hits + (c1.misses - c0.misses);
+        s->last_spt = t_dec / nout;
+        if (s->n_spt == 16) { memmove(s->spt_hist, s->spt_hist + 1, 15 * sizeof *s->spt_hist); s->n_spt--; }
+        s->spt_hist[s->n_spt++] = s->last_spt;
+    }
 
     char stats[256], d[32];
     duration(d, sizeof d, t_dec);
@@ -357,6 +525,16 @@ int glm53f_chat_turn(Glm53fChat *s, const Glm53fInput *in, Glm53fTurnSink *k)
     if (len < 0) len = 0;
     s->text[len] = 0;
     log_turn(s, in->shown ? in->shown : in->prompt, s->text, len, stats);
+    {
+        const char *close = strstr(s->text, "</think>");
+        free(s->last_answer);
+        s->last_answer = NULL;
+        if (close) {
+            close += 8;
+            while (*close == '\n' || *close == ' ') close++;
+            if (*close) s->last_answer = dup_str(close);
+        }
+    }
     k->done(k, stats, interrupted);
     return 0;
 }
@@ -456,5 +634,7 @@ int glm53f_chat_run(Glm53fChat *s)
     if (rc < 0) rc = plain_run(s);
     free(s->log);
     s->log = NULL;
+    free(s->last_answer);
+    s->last_answer = NULL;
     return rc;
 }

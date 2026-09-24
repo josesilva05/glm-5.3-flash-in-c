@@ -5,6 +5,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `localcode`: typing `/` opens a command menu above the input box, filtered as you type,
+  with each setting's current value. Commands that take a value list them: Reasoning
+  Effort, answer lengths with their time at the s/token this session measured, and the files
+  of a directory with their estimated tokens against the context left (folders open in
+  place). Up/down, tab, enter and esc drive it. `/help` and the menu come from one table.
+- `localcode`: `/stats` reports what the session measured: s/token per answer, prompt
+  reading speed, experts per token from RAM, read ahead or read on demand, GB read per token
+  and the share of a token spent waiting on the disk. `/copy` puts the last answer on the
+  clipboard. Nothing the model computes changes: the turn only reads the expert cache's
+  counters before and after decoding.
+
 ## [2.1.0] - 2026-09-17
 
 Everything since the first version that ran the released checkpoint: the interactive

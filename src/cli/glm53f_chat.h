@@ -12,6 +12,7 @@
 #define GLM53F_CHAT_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "glm53f_model.h"
 #include "glm53f_tok.h"
@@ -42,6 +43,20 @@ typedef struct {
     int          first;          /* the next message opens the conversation */
     char        *log;            /* the conversation as Markdown, for /save */
     size_t       log_len, log_cap;
+    char        *last_answer;    /* the last answer without its reasoning, for /copy */
+
+    /* measured over the session's answers, for /stats and the estimates in the menu */
+    int          turns;
+    long         pre_tok, dec_tok;
+    double       pre_s, dec_s;
+    double       dec_wait_s;     /* decode time spent waiting on expert reads  */
+    double       dec_read_gb;    /* experts read during decode, both paths     */
+    uint64_t     dec_reqs;       /* experts the answers used ...               */
+    uint64_t     dec_ahead;      /* ... read from the SSD ahead of their layer */
+    uint64_t     dec_demand;     /* ... read from the SSD when asked for       */
+    double       last_spt;       /* s/token of the last answer, 0 before one   */
+    double       spt_hist[16];   /* s/token of the last answers, oldest first  */
+    int          n_spt;
 } Glm53fChat;
 
 int glm53f_chat_run(Glm53fChat *s);
@@ -80,6 +95,19 @@ void glm53f_chat_stop(void);
 
 /* "context 88/2048 (4%)" and the settings line, for status rows. */
 void glm53f_chat_gauge(const Glm53fChat *s, char *buf, size_t cap);
+
+/* The commands, in the order /help and the menu list them. arg: 0 none, 1 optional, 2
+ * required. */
+typedef struct {
+    const char *name, *args, *help;
+    int         arg;
+} Glm53fCommand;
+
+extern const Glm53fCommand glm53f_commands[];
+extern const int           glm53f_ncommands;
+
+/* What a command's setting stands at ("Max", "2048", "folded"), or "" when it has none. */
+void glm53f_chat_command_value(const Glm53fChat *s, const Glm53fCommand *c, char *buf, size_t cap);
 
 /* Full-screen front end; returns 0, or -1 when the terminal cannot host it. */
 int  glm53f_tui_run(Glm53fChat *s, int forced);
