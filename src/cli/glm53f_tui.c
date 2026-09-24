@@ -924,15 +924,23 @@ static void menu_files(const char *typed)
     snprintf(M.title, sizeof M.title, "files in %s", *dir ? dir : "the working directory");
     snprintf(M.right, sizeof M.right, "%d positions left", left);
     for (int i = 0; i < n; i++) {
+        const DirEnt *e = &ents[i];
+        /* a path cut short would complete to the wrong file: leave out what does not fit */
+        char path[1500], tab[sizeof ((MenuItem *)0)->tab];
+        if (snprintf(path, sizeof path, "%s%s%s", dir, e->name, e->dir ? "/" : "") >= (int)sizeof path) continue;
+        const int q = quoted || strchr(path, ' ') != NULL;
+        const int tl = e->dir ? snprintf(tab, sizeof tab, "/file %s%s", q ? "\"" : "", path)
+                              : snprintf(tab, sizeof tab, q ? "/file \"%s\" " : "/file %s ", path);
+        if (tl >= (int)sizeof tab) continue;
         MenuItem *it = menu_add();
         if (!it) break;
-        const DirEnt *e = &ents[i];
-        char path[1500];
-        snprintf(path, sizeof path, "%s%s%s", dir, e->name, e->dir ? "/" : "");
-        const int q = quoted || strchr(path, ' ') != NULL;
-        if (e->dir) snprintf(it->tab, sizeof it->tab, "/file %s%s", q ? "\"" : "", path);
-        else        snprintf(it->tab, sizeof it->tab, q ? "/file \"%s\" " : "/file %s ", path);
-        snprintf(it->label, sizeof it->label, "%s%s", e->name, e->dir ? "/" : "");
+        memcpy(it->tab, tab, (size_t)tl + 1);
+        /* the label is only shown: a long name is cut, on a UTF-8 boundary, and ends in "..." */
+        if (snprintf(it->label, sizeof it->label, "%s%s", e->name, e->dir ? "/" : "") >= (int)sizeof it->label) {
+            size_t cut = sizeof it->label - 4;
+            while (cut > 0 && ((unsigned char)it->label[cut] & 0xC0) == 0x80) cut--;
+            memcpy(it->label + cut, "...", 4);
+        }
         if (e->dir) {
             snprintf(it->hint, sizeof it->hint, "folder");
         } else {
