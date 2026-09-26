@@ -196,6 +196,7 @@ cache report. The JSON report holds prompt ids, generated ids and text, and the 
 | `GLM53F_SPAN=N` | positions a prefill takes layer by layer at once (default 4096, ARCHITECTURE.md 2.3); the output does not depend on it |
 | `GLM53F_IO_PRIORITY=low` | (Windows) mark the checkpoint's reads low priority, so the system and other programs, including the page file on the same drive, go first and the machine stays responsive while the model reads. Off by default: Windows also slows low-priority reads on an idle drive, and decode measured 13% slower (PERFORMANCE.md) |
 | `GLM53F_ROUTE_TRACE=path` | append one line per decode MoE layer: layer, the 8 routed experts, microseconds waiting for reads, microseconds computing |
+| `GLM53F_ROUTE_TOP16=path` | append one line per decode MoE layer: the layer, then the router's 16 best candidates in selection order as `id:score` (sigmoid, before normalisation); the first 8 are the experts chosen. Recomputes only the gate product; the output does not change. `tools/route_cache_sim.py` replays such a trace through an LRU cache to size approximate routing policies (PERFORMANCE.md) |
 
 ## GPU environment variables
 
@@ -207,6 +208,9 @@ cache report. The JSON report holds prompt ids, generated ids and text, and the 
 | `GLM53F_GPU_PROFILE=1` | at exit, print decode time split into GPU trunk, CPU routed experts and head |
 | `GLM53F_GPU_PROFILE=2` | also synchronise after every section of a decode step and print per-section times (perturbs timing) |
 | `GLM53F_GPU_LAYERS_PER_DEV=N` | cap layers per device (forces a multi-device placement; tests use it) |
+| `GLM53F_GPU_EXPERTS=N` | in decode, multiply up to N of each MoE layer's routed experts on one device while the CPU multiplies the others (ARCHITECTURE.md 2.8). Int4 experts only (`--int4-dir` or `--experts int4`); the output is unchanged. Off by default: on this machine it gained ~5%, because the SSD then sets the pace (PERFORMANCE.md) |
+| `GLM53F_GPU_EXPERTS_DEV=K` | the CUDA device for `GLM53F_GPU_EXPERTS` (default: the one holding the lm_head; choose one on a wide PCIe link) |
+| `GLM53F_GPU_EXPERTS_PIN_GB=X` | how much of the expert cache to page-lock for it (default 24; only experts in that part go to the device, and the page-locked RAM is taken from the system's pager) |
 
 ## Tuning memory
 

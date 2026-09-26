@@ -170,6 +170,64 @@ extern "C" void gk_swiglu(float *y, const float *gate, const float *up, int rows
     k_swiglu<<<gk_grid(total), GK_BLOCK>>>(y, gate, up, limit, total);
 }
 
+extern "C" void gk_swiglu_on(float *y, const float *gate, const float *up, int n, float limit, void *stream)
+{
+    k_swiglu<<<gk_grid(n), GK_BLOCK, 0, (cudaStream_t)stream>>>(y, gate, up, limit, (int64_t)n);
+}
+
+/* ------------------------------------------------------------- int4 matvec ---- */
+/* matmul_i4 (glm53f_ops.c) for one input vector. One warp per output row: each lane takes
+ * whole groups and forms the group sum as the CPU does (eight float accumulators fed by
+ * fmaf in column order, then the same double reduction tree), times the group step in
+ * double; lane 0 then adds the group products in group order into the double accumulator.
+ * Same operations in the same order, so y is bit-identical to the CPU kernel. */
+#define GK_I4_WARPS 8
+#define GK_I4_MAXG  64                       /* groups per row held in shared memory */
+
+__global__ static void k_mv_i4(float *y, const float *x, const unsigned char *W, const float *S,
+                               int R, int C)
+{
+    extern __shared__ float xs[];            /* C floats, then GK_I4_WARPS * GK_I4_MAXG doubles */
+    double *prod = (double *)(xs + ((C + 1) & ~1));
+    for (int i = threadIdx.x; i < C; i += blockDim.x) xs[i] = x[i];
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r = blockIdx.x * GK_I4_WARPS + warp;
+    if (r >= R) return;
+    const int groups = C / 64;
+    const unsigned char *row = W + (size_t)r * (C / 2);
+    const float *srow = S + (size_t)r * groups;
+    double *p = prod + warp * GK_I4_MAXG;
+    for (int g = lane; g < groups; g += 32) {
+        const int j0 = g * 64;
+        float a[8] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+        for (int j = j0; j < j0 + 64; j += 8) {
+            const unsigned int w = *(const unsigned int *)(row + (j >> 1));   /* 8 levels, low nibble first */
+#pragma unroll
+            for (int l = 0; l < 8; l++)
+                a[l] = fmaf((float)((int)((w >> (4 * l)) & 15u) - 8), xs[j + l], a[l]);
+        }
+        const double bsum = (((double)a[0] + a[4]) + ((double)a[2] + a[6]))
+                          + (((double)a[1] + a[5]) + ((double)a[3] + a[7]));
+        p[g] = bsum * (double)srow[g];
+    }
+    __syncwarp();
+    if (lane == 0) {
+        double acc = 0.0;
+        for (int g = 0; g < groups; g++) acc += p[g];
+        y[r] = (float)acc;
+    }
+}
+
+extern "C" int gk_mv_i4_on(float *y, const float *x, const unsigned char *W, const float *S, int R, int C,
+                           void *stream)
+{
+    if (C % 64 || C / 64 > GK_I4_MAXG) return -1;
+    const size_t shm = (size_t)((C + 1) & ~1) * sizeof(float) + (size_t)GK_I4_WARPS * GK_I4_MAXG * sizeof(double);
+    k_mv_i4<<<(R + GK_I4_WARPS - 1) / GK_I4_WARPS, GK_I4_WARPS * 32, shm, (cudaStream_t)stream>>>(y, x, W, S, R, C);
+    return 0;
+}
+
 __global__ static void k_add(float *y, const float *x, int64_t n)
 {
     GK_INDEX(n);

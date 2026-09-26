@@ -39,6 +39,7 @@ static void glm53f_fatal_bound(const char *what, long value, long limit)
 }
 
 long glm53f_expert_drops = 0;
+Glm53fExpertOffload *glm53f_expert_offload = NULL;
 int  glm53f_quiet = 0;
 const char *glm53f_i4_dir = NULL;
 
@@ -1040,6 +1041,44 @@ static void route_topn(int *idx, int n, const float *x, const float *gate, const
     }
 }
 
+/* GLM53F_ROUTE_TOP16=path: append one line per decode MoE layer with the 16 best
+ * candidates in selection order (score + bias), each as id:score, score being the sigmoid
+ * before normalisation. The first topk are the experts the router chose. Diagnostics only:
+ * it recomputes the gate product and changes nothing the model computes. */
+static void route_top16_trace(int layer, const float *x, const Glm53fMoeW *m, const Glm53fCfg *c)
+{
+    static FILE *f = NULL;
+    static int on = -1;
+    if (on < 0) {
+        const char *p = getenv("GLM53F_ROUTE_TOP16");
+        f = p ? fopen(p, "a") : NULL;
+        on = f != NULL;
+    }
+    if (!on) return;
+    const int NE = c->n_experts, E = c->hidden, N = NE < 16 ? NE : 16;
+    float score[1024], choice[1024];
+    int e;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (e = 0; e < NE; e++) {
+        const float *row = m->gate + (size_t)e * E;
+        double acc = 0.0;
+        for (int i = 0; i < E; i++) acc += (double)row[i] * (double)x[i];
+        score[e]  = sigmoidf_((float)acc);
+        choice[e] = score[e] + m->bias[e];
+    }
+    fprintf(f, "%d", layer);
+    for (int j = 0; j < N; j++) {
+        int best = 0;
+        for (int ee = 1; ee < NE; ee++) if (choice[ee] > choice[best]) best = ee;
+        fprintf(f, " %d:%.6g", best, score[best]);
+        choice[best] = -INFINITY;
+    }
+    fputc('\n', f);
+    fflush(f);
+}
+
 static int in_set(int v, const int *s, int n)
 {
     for (int i = 0; i < n; i++) if (s[i] == v) return 1;
@@ -1136,6 +1175,7 @@ static void moe_chunk(float *out, const float *x, const Glm53fMoeW *w, const Glm
     }
     if (glm53f_ps.on < 0) glm53f_ps.on = getenv("GLM53F_PREDICT_STATS") ? 1 : 0;
     if (glm53f_ps.on && T == 1) predict_stats(w, c, ids, x);
+    if (T == 1) route_top16_trace(w->layer, x, w, c);
 
     /* With prefetch: hand this layer's experts and the predicted experts of the next layer
      * to the background readers, then take each routed expert as it lands (get() waits for
@@ -1199,6 +1239,13 @@ static void moe_chunk(float *out, const float *x, const Glm53fMoeW *w, const Glm
     double tr_wait = 0.0, tr_comp = 0.0;
     struct timespec tr_a, tr_b;   /* clock_gettime: C11's timespec_get is not in gnu99 */
 
+    /* Decode experts handed to glm53f_expert_offload: released once it has finished, and
+     * computed here after all if it failed. */
+    Glm53fExpertOffload *off = T == 1 ? glm53f_expert_offload : NULL;
+    int n_off = 0, off_e[GLM53F_MAX_TOPK];
+    Glm53fExpertQ off_q[GLM53F_MAX_TOPK];
+    float *off_dst[GLM53F_MAX_TOPK];
+
     for (int b0 = 0; b0 < nu; b0 += GLM53F_MOE_BATCH) {
         const int bn = (nu - b0) < GLM53F_MOE_BATCH ? (nu - b0) : GLM53F_MOE_BATCH;
         if (!prefetch && w->src->getmany) w->src->getmany(w->src, w->layer, uniq + b0, bn);
@@ -1229,10 +1276,16 @@ static void moe_chunk(float *out, const float *x, const Glm53fMoeW *w, const Glm
                     if (ids[(size_t)t * K + j] == e) { tok[nt] = t; slot[nt] = j; nt++; }
             if (nt == 1) {                       /* decode: one token, no gathering */
                 const float *xt = x + (size_t)tok[0] * E;
+                float *dst = contrib + ((size_t)tok[0] * K + slot[0]) * E;
+                if (off && n_off < GLM53F_MAX_TOPK && q.gate.dt == GLM53F_WI4 &&
+                    off->submit(off->ctx, &q, xt, dst)) {
+                    off_e[n_off] = e; off_q[n_off] = q; off_dst[n_off] = dst; n_off++;
+                    continue;                    /* released after off->wait() */
+                }
                 glm53f_mm(gu, xt, &q.gate);
                 glm53f_mm(gu + I, xt, &q.up);
                 glm53f_swiglu_clamp(act, gu, I, c->swiglu_limit);
-                glm53f_mm(contrib + ((size_t)tok[0] * K + slot[0]) * E, act, &q.down);
+                glm53f_mm(dst, act, &q.down);
             } else if (nt > 1) {
                 for (int i = 0; i < nt; i++)
                     memcpy(xb + (size_t)i * E, x + (size_t)tok[i] * E, (size_t)E * sizeof(float));
@@ -1253,6 +1306,18 @@ static void moe_chunk(float *out, const float *x, const Glm53fMoeW *w, const Glm
                 tr_comp += (double)(tr_a.tv_sec - tr_b.tv_sec) * 1e6 + (double)(tr_a.tv_nsec - tr_b.tv_nsec) / 1e3;
             }
             if (w->src->release) w->src->release(w->src, w->layer, e);
+        }
+    }
+    if (n_off) {
+        const int failed = off->wait(off->ctx);
+        for (int i = 0; i < n_off; i++) {
+            if (failed) {
+                glm53f_mm(gu, x, &off_q[i].gate);
+                glm53f_mm(gu + I, x, &off_q[i].up);
+                glm53f_swiglu_clamp(act, gu, I, c->swiglu_limit);
+                glm53f_mm(off_dst[i], act, &off_q[i].down);
+            }
+            if (w->src->release) w->src->release(w->src, w->layer, off_e[i]);
         }
     }
     if (trace_on && T == 1) {

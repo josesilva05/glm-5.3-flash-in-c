@@ -267,6 +267,24 @@ typedef struct {
     Glm53fMat    eh;                   /* [hidden][2*hidden]                    */
 } Glm53fMtpW;
 
+/* Optional second worker for decode's routed experts (GLM53F_WI4 only). While the CPU
+ * multiplies some of a layer's experts, submit() hands others to another device; the MoE
+ * waits for them before summing. Each contribution is kept per (token, slot) and summed in
+ * top-k order as before, so where an expert was computed does not change the sum. */
+typedef struct {
+    void *ctx;
+    /* Queue expert q applied to x[hidden]; its product goes to out[hidden] by the time
+     * wait() returns. 0 when it cannot take it (the CPU computes it instead). q's memory
+     * must stay valid until wait() returns. */
+    int (*submit)(void *ctx, const Glm53fExpertQ *q, const float *x, float *out);
+    /* Wait for everything submitted since the last wait. Non-zero if any failed; the caller
+     * then computes those experts itself. */
+    int (*wait)(void *ctx);
+} Glm53fExpertOffload;
+
+/* NULL unless a backend installed one (the CUDA backend with GLM53F_GPU_EXPERTS). */
+extern Glm53fExpertOffload *glm53f_expert_offload;
+
 /* ------------------------------------------------------------------ kernels ---- */
 /* Routed experts that failed to load. Non-zero means corrupt output; callers must fail. */
 extern long glm53f_expert_drops;
