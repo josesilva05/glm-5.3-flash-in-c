@@ -1041,6 +1041,44 @@ static void route_topn(int *idx, int n, const float *x, const float *gate, const
     }
 }
 
+/* GLM53F_ROUTE_TOP16=path: append one line per decode MoE layer with the 16 best
+ * candidates in selection order (score + bias), each as id:score, score being the sigmoid
+ * before normalisation. The first topk are the experts the router chose. Diagnostics only:
+ * it recomputes the gate product and changes nothing the model computes. */
+static void route_top16_trace(int layer, const float *x, const Glm53fMoeW *m, const Glm53fCfg *c)
+{
+    static FILE *f = NULL;
+    static int on = -1;
+    if (on < 0) {
+        const char *p = getenv("GLM53F_ROUTE_TOP16");
+        f = p ? fopen(p, "a") : NULL;
+        on = f != NULL;
+    }
+    if (!on) return;
+    const int NE = c->n_experts, E = c->hidden, N = NE < 16 ? NE : 16;
+    float score[1024], choice[1024];
+    int e;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (e = 0; e < NE; e++) {
+        const float *row = m->gate + (size_t)e * E;
+        double acc = 0.0;
+        for (int i = 0; i < E; i++) acc += (double)row[i] * (double)x[i];
+        score[e]  = sigmoidf_((float)acc);
+        choice[e] = score[e] + m->bias[e];
+    }
+    fprintf(f, "%d", layer);
+    for (int j = 0; j < N; j++) {
+        int best = 0;
+        for (int ee = 1; ee < NE; ee++) if (choice[ee] > choice[best]) best = ee;
+        fprintf(f, " %d:%.6g", best, score[best]);
+        choice[best] = -INFINITY;
+    }
+    fputc('\n', f);
+    fflush(f);
+}
+
 static int in_set(int v, const int *s, int n)
 {
     for (int i = 0; i < n; i++) if (s[i] == v) return 1;
@@ -1137,6 +1175,7 @@ static void moe_chunk(float *out, const float *x, const Glm53fMoeW *w, const Glm
     }
     if (glm53f_ps.on < 0) glm53f_ps.on = getenv("GLM53F_PREDICT_STATS") ? 1 : 0;
     if (glm53f_ps.on && T == 1) predict_stats(w, c, ids, x);
+    if (T == 1) route_top16_trace(w->layer, x, w, c);
 
     /* With prefetch: hand this layer's experts and the predicted experts of the next layer
      * to the background readers, then take each routed expert as it lands (get() waits for
