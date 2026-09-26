@@ -51,6 +51,13 @@ With the optional CUDA backend (`-DGLM53F_CUDA=ON`, `--gpu`) the trunk runs on t
 same peak RSS (`--cache-gb 38`), with the same generated tokens; see
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
+With the optional int4 expert container (`--write-int4`, all 42 MoE layers, ~171 GB; an
+approximation of the checkpoint, not the checkpoint) decode takes **0.69-0.72 s/token**
+with `--gpu --cache-gb 38`. On this machine that is close to the ceiling the SSD sets
+(~1.6 GB of expert reads per token): moving expert products to the second GPU
+(`GLM53F_GPU_EXPERTS`) cut compute but not the step. Development is paused there; the
+measurements and what was tried are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
 ### Architecture implemented
 
 - **mHC** residual: 4 streams; per sub-block, learned collapse weights and a Sinkhorn-normalised 4x4 mixer.

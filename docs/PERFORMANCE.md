@@ -49,6 +49,8 @@ Estimated multiply-adds per token, by component:
 
 ## Storage throughput
 
+(Measured in September 2026 the checkpoint's files read slower; see "Reading the FP8 checkpoint got slower" below.)
+
 `build/Release/bench_expert_io <model_dir> [experts]` reads random routed experts through the
 engine's O_DIRECT path at 1-32 concurrent reads.
 
@@ -256,6 +258,8 @@ when the token starts, 3.3-4.1 GB that the SSD delivers at ~2.6 GB/s in ~1.3-1.6
 
 ### Experts on the GPUs (not implemented: slower on this machine)
 
+(With int4 experts and page-locked memory the balance changes; see "Routed experts on a device" below.)
+
 | measurement | GPU 0 (PCIe 3.0 x4) | GPU 1 (PCIe 4.0 x16) |
 |---|---|---|
 | copy one expert (25.2 MB) to the device | 8.9 ms | 1.0 ms |
@@ -434,3 +438,129 @@ from knowing the future, not from a hot set an online policy could learn.
 Remaining levers on the exact path: more memory for the cache, faster storage, and a
 lossless container (E4M3 codes carry less than 8 bits of entropy, but a converted copy
 needs disk space this machine does not have).
+
+## September 2026: the full int4 container, the SSD, and the GPU as a second worker
+
+Same machine, `--gpu`, 38 GB cache unless stated, 18-token chat prompt, 64 generated
+tokens; s/token is the median over steps 3-63.
+
+### The full int4 container
+
+The container was completed (layers 28-44 written in 629 s after freeing disk space; all 42
+layers pass `--verify-int4`). With every layer read from it:
+
+| run | s/token | reads per token | wait on reads | compute |
+|---|---|---|---|---|
+| container with 25 of 42 layers (the rest quantised on the way in) | 1.01 | 2.00 GB | 0.51 s | ~0.56 s |
+| **container with all 42 layers** | **0.69-0.72** | **1.58 GB** | **0.14-0.16 s** | 0.56-0.58 s |
+| `localcode`, same container, two answers (66 and 144 tokens) | 0.66-0.69 | - | - | - |
+
+The generated text is identical with the partial and the full container (it is the same
+int4 arithmetic; only the bytes come from a different file). For comparison, a `localcode`
+session on the exact FP8 path the same day took 3.55 s/token: the automatic cache came out
+at 33.7 GB because other programs held RAM, and every read came from the slow FP8 files
+described next.
+
+Right after a large write the drive stalls reads for minutes: the first run after writing
+the 69 GB of layers 28-44 had steps of up to 29 s, and a run just after a 4 GB test write
+had seven steps of 13-39 s. Runs a few minutes later were clean.
+
+### Reading the FP8 checkpoint got slower
+
+`bench_expert_io` gave 1.66-1.89 GB/s at every queue depth on 2026-09-23/24, against
+2.32-2.53 GB/s in the table above, and FP8 decode went from 1.80 to 2.48 s/token. Ruled out:
+free space (98-117 GB free after cleaning up), TRIM (`Optimize-Volume -ReTrim`), the PCIe
+link (Gen4 x4, its maximum), PCIe link power management (off, no change), temperature
+(59 °C idle, 67-73 °C under load), wear (0%), and reader threads (2, 4 and 8 all slower
+or equal).
+
+Unbuffered random 25 MB reads, per file set:
+
+| files | written | GB/s |
+|---|---|---|
+| a file written seconds before | same day | 3.7-5.9 (partly the drive's write cache) |
+| the int4 container | 2026-09-17 | 3.2-3.3 |
+| the FP8 checkpoint | 2026-09-14/15 (download) | 1.5-1.7 |
+
+Per FP8 shard (8 random reads each) the speed ranges from 0.51 to 4.10 GB/s, median 1.63;
+47 of the 62 shards read below 2 GB/s. A sequential copy of one shard (SHA-256 identical)
+read 3.8-3.9 GB/s after 15 idle minutes against 2.6-2.8 for the original, so how the
+download was laid out on the drive costs reads, not the drive itself. The checkpoint was
+not rewritten.
+
+### Prefetch retuned for int4 (container with 25 of 42 layers)
+
+| configuration | s/token |
+|---|---|
+| `--prefetch 6`, 2 readers (default) | **1.01** |
+| `--prefetch 4` | 1.02 |
+| `--prefetch 8` | 1.08 |
+| `--prefetch 10` | 1.13 |
+| 3 readers | 1.07 |
+| 4 readers | 1.09 |
+
+The defaults chosen for FP8 are still the best; all six runs produced the same text.
+
+### Routed experts on a device (`GLM53F_GPU_EXPERTS`, off by default)
+
+With the full container, the route trace put a token at 0.51 s waiting on reads, 0.30 s
+multiplying routed experts on the CPU and ~0.26 s in the trunk, so the experts were moved
+to the idle GPU. A standalone benchmark on 64 real int4 experts on cuda:1 (PCIe 4.0 x16):
+
+| step | per 14.16 MB expert |
+|---|---|
+| CPU product (from the trace) | ~0.89 ms |
+| copy host -> device, pageable | 1.09-1.25 ms (11-13 GB/s) |
+| copy host -> device, page-locked | 0.53 ms (26.6 GB/s) |
+| the product on the device, weights already in VRAM | 0.17 ms |
+| one layer of 8 experts, copies overlapping products, page-locked | 4.3 ms per layer (0.18 s per token) |
+| the same from pageable memory | 8.7-10.6 ms per layer |
+
+`cudaHostRegister` accepted 8, 16 and 24 GB of the arena and refused 30 and 38 GB. In the
+engine (ARCHITECTURE.md 2.8), one run each, same text as without it in every run:
+
+| arm | s/token | wait on reads | compute |
+|---|---|---|---|
+| off | 0.690 | 0.14 s | 0.58 s |
+| N = 3 | 0.650 | 0.19 s | - |
+| N = 5 | 0.680 | 0.21 s | 0.47 s |
+| N = 8 | 0.700 | 0.21 s | - |
+| off, keep-warm off | 0.680 | 0.15 s | - |
+| N = 5, keep-warm off | 0.660 | 0.21 s | - |
+| N = 8, keep-warm off | 0.660 | 0.22 s | - |
+
+Compute fell by 0.11 s and the wait on reads rose by about as much. A token reads 1.58 GB,
+~0.5 s of this SSD at ~3.2 GB/s; prefetch used to hide most of it behind compute, and with
+less compute there is less to hide it behind. At ~5% at best, within run-to-run noise, it
+stays off by default.
+
+### Cache-aware routing (simulated, not built)
+
+With reads setting the pace again, the next lever is to need fewer of them.
+`GLM53F_ROUTE_TOP16` recorded 299 decode tokens and `tools/route_cache_sim.py` replayed
+them through a 2,684-slot LRU cache (38 GB of int4), 40 tokens of warm-up. "swap" replaces
+a missing chosen expert whose normalised weight is below the threshold by the best
+resident candidate among the router's 9th-16th; "drop" skips chosen experts below it.
+
+| policy | reads per token | vs exact | experts per token | routing weight moved | layers changed |
+|---|---|---|---|---|---|
+| exact | 92.0 | 100% | 336 | 0% | 0% |
+| swap < 0.05 | 80.6 | 88% | 336 | 1.1% | 19% |
+| swap < 0.10 | 42.9 | 47% | 336 | 9.8% | 80% |
+| swap < 0.15 | 29.7 | 32% | 336 | 16.9% | 93% |
+| drop < 0.05 | 78.9 | 86% | 307 | 2.7% | 27% |
+| drop < 0.08 | 50.5 | 55% | 233 | 14.4% | 81% |
+| swap everything that has a resident substitute | 21.8 | 24% | 336 | 33.1% | 97% |
+
+The simulation is open loop (the trace is the exact model's routing; a policy that changes
+the output also changes later routing), so it sizes the SSD traffic at stake, not the
+quality. Halving the reads moves ~10% of the routing weight in 80% of the layers, which is
+likely to change the text; the mild settings save 12-14%. None of it was built.
+
+### Where this leaves the machine
+
+On 64 GB of RAM and this SSD the int4 path is bound at roughly 0.5 s per token by reads
+(~2 tokens/s), whatever computes the rest: the GPU offload above showed it. Engines that
+report 15-25 tokens/s on comparable models (FreeToken, llama.cpp with smaller MoE models)
+hold every expert in RAM. What would move this machine: more RAM (the board takes 128 GB),
+a second or faster SSD, or an approximate routing policy validated against the exact path.

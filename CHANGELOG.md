@@ -17,6 +17,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and the share of a token spent waiting on the disk. `/copy` puts the last answer on the
   clipboard. Nothing the model computes changes: the turn only reads the expert cache's
   counters before and after decoding.
+- `start.bat` opens `localcode` with a double-click (model directory from its argument,
+  `LOCALCODE_MODEL` or `%USERPROFILE%\model\GLM-5.3-Flash`; `LOCALCODE_INT4` adds
+  `--int4-dir`).
+- `GLM53F_GPU_EXPERTS=N` (CUDA backend, int4 experts, off by default): in decode, up to N of
+  each MoE layer's routed experts are multiplied on one device while the CPU multiplies the
+  others, from the page-locked part of the expert cache. The device kernel repeats the
+  CPU's int4 arithmetic, so the output is unchanged. Measured ~5% faster at best on the
+  reference machine, where the SSD then sets the pace.
+- `GLM53F_ROUTE_TOP16=path` records the router's 16 best candidates per decode MoE layer,
+  and `tools/route_cache_sim.py` replays such a trace through an LRU cache to size
+  approximate routing policies (swapping or dropping low-weight experts). Diagnostics only.
+
+### Fixed
+
+- `localcode`: the `/file` menu no longer builds a path or completion that `snprintf` cut
+  short; such entries are left out, and labels too long to show end in "..." (gcc's
+  `-Wformat-truncation` failed the warnings-as-errors build).
 
 ## [2.1.0] - 2026-09-17
 

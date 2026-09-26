@@ -320,6 +320,17 @@ While the CPU computes experts, a host thread keeps each device busy with a thro
 queue behind at most one of them (~0.2 ms). The cards stay in P2 at ~85-90 W each.
 `GLM53F_GPU_WARM=0` disables it.
 
+**Routed experts on a device (optional).** With `GLM53F_GPU_EXPERTS=N` and int4 experts, a
+decode MoE layer hands up to N of its routed experts to one device (`Glm53fExpertOffload`,
+glm53f.h) and multiplies the others on the CPU at the same time. The weights stay in the
+host cache and cross PCIe per use, which only beats the CPU from page-locked memory, so
+the first `GLM53F_GPU_EXPERTS_PIN_GB` (default 24) of the cache arena are registered with
+`cudaHostRegister` and only experts whose slot lies there are sent. The device kernel
+repeats `matmul_i4` operation for operation (float accumulators fed by fmaf, the same
+double reduction tree, groups summed in order) and contributions are still summed in top-k
+order, so the output does not depend on where an expert ran. If the device fails, the CPU
+computes those experts and keeps them from then on.
+
 Validation: `test_glm_tiny` GATE G1-G3 repeat the reference checks with the trunk on the
 GPU and layers split across devices; on the real checkpoint the 45-layer logits stay within
 2.1e-5 of the reference and 40 greedy tokens match the CPU run (VALIDATION.md 2.2).
