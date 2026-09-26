@@ -24,9 +24,11 @@
 #include <windows.h>
 #include <direct.h>
 #else
+#include <dirent.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
 #endif
@@ -56,8 +58,9 @@ static double now_s(void)
 
 static void duration(char *buf, size_t cap, double sec)
 {
-    if (sec < 60.0) snprintf(buf, cap, "%.1fs", sec);
-    else            snprintf(buf, cap, "%dm %02ds", (int)(sec / 60.0), (int)sec % 60);
+    if (sec < 60.0)        snprintf(buf, cap, "%.1fs", sec);
+    else if (sec < 3600.0) snprintf(buf, cap, "%dm %02ds", (int)(sec / 60.0), (int)sec % 60);
+    else                   snprintf(buf, cap, "%dh %02dm", (int)(sec / 3600.0), (int)(sec / 60.0) % 60);
 }
 
 static int is_cont(char c) { return ((unsigned char)c & 0xC0) == 0x80; }
@@ -678,8 +681,11 @@ static struct { Buf b; int cur; } E;                 /* the text being typed, cu
 static char *g_hist[64];
 static int   g_nhist, g_hpos;
 
+static void menu_touch(void);                        /* an edit reopens the menu */
+
 static void ed_set(const char *p)
 {
+    menu_touch();
     E.b.n = 0;
     if (E.b.p) E.b.p[0] = 0;
     buf_str(&E.b, p);
@@ -688,6 +694,7 @@ static void ed_set(const char *p)
 
 static void ed_insert(const char *p, int n)
 {
+    menu_touch();
     buf_add(&E.b, "", 0);
     Buf nb = { 0 };
     buf_add(&nb, E.b.p ? E.b.p : "", (size_t)E.cur);
@@ -701,6 +708,7 @@ static void ed_insert(const char *p, int n)
 static void ed_erase(int from, int to)
 {
     if (from < 0 || to > (int)E.b.n || from >= to) return;
+    menu_touch();
     memmove(E.b.p + from, E.b.p + to, E.b.n - (size_t)to + 1);
     E.b.n -= (size_t)(to - from);
     E.cur = from;
@@ -709,9 +717,354 @@ static void ed_erase(int from, int to)
 static int ed_prev(int i) { if (i <= 0) return 0; i--; while (i > 0 && is_cont(E.b.p[i])) i--; return i; }
 static int ed_next(int i) { if (i >= (int)E.b.n) return (int)E.b.n; i++; while (i < (int)E.b.n && is_cont(E.b.p[i])) i++; return i; }
 
-/* ------------------------------------------------------------------ session ---- */
+/* --------------------------------------------------------------------- menu ---- */
+/* Typing "/" opens a menu above the input box, built from what has been typed: the
+ * commands (by prefix, then by the letters in order), then a command's values - Reasoning
+ * Effort, answer lengths with the time they would take at the speed this session measured,
+ * the files of a directory with the tokens they would take out of the context left. */
 
 static Glm53fChat *g_s;
+
+#define MENU_MAX  64
+#define MENU_ROWS 8
+
+typedef struct {
+    char tab[1100];              /* the editor text choosing it leaves               */
+    char label[160], hint[200], value[48];
+    int  submits;                /* enter sends `tab`; otherwise enter only fills it */
+} MenuItem;
+
+static struct {
+    MenuItem it[MENU_MAX];
+    int      n, sel, closed;
+    int      raw_enter;          /* enter sends what was typed (/gen 300)            */
+    char     title[160], right[96];
+    char    *key;                /* the editor text the items were built for         */
+    double   built;
+} M;
+
+static void menu_touch(void) { M.closed = 0; M.sel = 0; }
+
+static MenuItem *menu_add(void)
+{
+    if (M.n == MENU_MAX) return NULL;
+    MenuItem *it = &M.it[M.n++];
+    memset(it, 0, sizeof *it);
+    return it;
+}
+
+static int lower(int c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
+
+static int starts_with_ci(const char *s, const char *pre)
+{
+    while (*pre) if (lower((unsigned char)*s++) != lower((unsigned char)*pre++)) return 0;
+    return 1;
+}
+
+/* the letters of `typed` appear in `name` in order */
+static int subsequence(const char *name, const char *typed)
+{
+    for (; *typed; typed++) {
+        while (*name && lower((unsigned char)*name) != lower((unsigned char)*typed)) name++;
+        if (!*name) return 0;
+        name++;
+    }
+    return 1;
+}
+
+static void menu_commands(const char *typed)
+{
+    snprintf(M.title, sizeof M.title, "commands");
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < glm53f_ncommands; i++) {
+            const Glm53fCommand *c = &glm53f_commands[i];
+            const int pre = starts_with_ci(c->name, typed);
+            if (pass == 0 ? !pre : (pre || !subsequence(c->name + 1, typed + 1))) continue;
+            MenuItem *it = menu_add();
+            if (!it) return;
+            snprintf(it->tab, sizeof it->tab, "%s%s", c->name, c->arg ? " " : "");
+            snprintf(it->label, sizeof it->label, "%s%s%s", c->name, *c->args ? " " : "", c->args);
+            snprintf(it->hint, sizeof it->hint, "%s", c->help);
+            glm53f_chat_command_value(g_s, c, it->value, sizeof it->value);
+            it->submits = c->arg != 2;
+        }
+}
+
+static void menu_reasoning(const char *typed)
+{
+    static const char *v[3][2] = {
+        { "max",  "reasons the longest before answering (the default)" },
+        { "high", "reasons less" },
+        { "low",  "the shortest reasoning: the answer starts soonest" },
+    };
+    snprintf(M.title, sizeof M.title, "Reasoning Effort");
+    for (int i = 0; i < 3; i++) {
+        if (!starts_with_ci(v[i][0], typed)) continue;
+        MenuItem *it = menu_add();
+        snprintf(it->tab, sizeof it->tab, "/reasoning %s", v[i][0]);
+        snprintf(it->label, sizeof it->label, "%s", v[i][0]);
+        snprintf(it->hint, sizeof it->hint, "%s", v[i][1]);
+        if (lower((unsigned char)g_s->reasoning[0]) == v[i][0][0]) snprintf(it->value, sizeof it->value, "now");
+        it->submits = 1;
+    }
+}
+
+static void menu_gen(const char *typed)
+{
+    static const int v[] = { 256, 512, 1024, 2048, 4096 };
+    const int left = g_s->m->cap - g_s->m->cached;
+    snprintf(M.title, sizeof M.title, "tokens per answer");
+    int numeric = *typed != 0;
+    for (const char *p = typed; *p; p++) if (*p < '0' || *p > '9') numeric = 0;
+    M.raw_enter = numeric;
+    for (int i = 0; i < (int)(sizeof v / sizeof *v); i++) {
+        if (v[i] > GLM53F_MAX_GEN || v[i] > g_s->m->cap) break;
+        char num[16];
+        snprintf(num, sizeof num, "%d", v[i]);
+        if (!starts_with_ci(num, typed)) continue;
+        MenuItem *it = menu_add();
+        snprintf(it->tab, sizeof it->tab, "/gen %d", v[i]);
+        snprintf(it->label, sizeof it->label, "%d", v[i]);
+        if (g_s->last_spt > 0.0) {
+            char d[32];
+            duration(d, sizeof d, v[i] * g_s->last_spt);
+            snprintf(it->hint, sizeof it->hint, "up to %s at the last answer's %.2f s/token", d, g_s->last_spt);
+        } else {
+            snprintf(it->hint, sizeof it->hint, "its time shows once an answer has been measured");
+        }
+        if (v[i] > left) {
+            const size_t k = strlen(it->hint);
+            snprintf(it->hint + k, sizeof it->hint - k, " · more than the %d positions left", left);
+        }
+        if (v[i] == g_s->gen) snprintf(it->value, sizeof it->value, "now");
+        it->submits = 1;
+    }
+}
+
+/* ---- files, for /file ---- */
+
+typedef struct { char name[400]; int dir; long long size; } DirEnt;
+
+static int dirent_cmp(const void *a, const void *b)
+{
+    const DirEnt *x = (const DirEnt *)a, *y = (const DirEnt *)b;
+    if (x->dir != y->dir) return y->dir - x->dir;
+    const char *p = x->name, *q = y->name;
+    while (*p && lower((unsigned char)*p) == lower((unsigned char)*q)) { p++; q++; }
+    return lower((unsigned char)*p) - lower((unsigned char)*q);
+}
+
+/* Up to cap entries of directory dir ("" is the working directory) whose name starts with pre. */
+static int list_dir(const char *dir, const char *pre, DirEnt *out, int cap)
+{
+    int n = 0;
+    const int hidden = pre[0] == '.';
+#ifdef _WIN32
+    char pat[1100];
+    wchar_t wpat[1100];
+    snprintf(pat, sizeof pat, "%s*", *dir ? dir : ".\\");
+    if (!MultiByteToWideChar(CP_UTF8, 0, pat, -1, wpat, 1100)) return 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        DirEnt *e = &out[n];
+        if (!WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, e->name, (int)sizeof e->name, NULL, NULL)) continue;
+        if (!strcmp(e->name, ".") || !strcmp(e->name, "..")) continue;
+        if ((e->name[0] == '.' || (fd.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN)) && !hidden) continue;
+        if (!starts_with_ci(e->name, pre)) continue;
+        e->dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        e->size = (long long)fd.nFileSizeHigh << 32 | fd.nFileSizeLow;
+        n++;
+    } while (n < cap && FindNextFileW(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(*dir ? dir : ".");
+    if (!d) return 0;
+    struct dirent *de;
+    while (n < cap && (de = readdir(d)) != NULL) {
+        DirEnt *e = &out[n];
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        if (de->d_name[0] == '.' && !hidden) continue;
+        if (!starts_with_ci(de->d_name, pre)) continue;
+        snprintf(e->name, sizeof e->name, "%s", de->d_name);
+        char full[1500];
+        snprintf(full, sizeof full, "%s%s", dir, de->d_name);
+        struct stat st;
+        if (stat(full, &st) != 0) continue;
+        e->dir = S_ISDIR(st.st_mode);
+        e->size = (long long)st.st_size;
+        n++;
+    }
+    closedir(d);
+#endif
+    qsort(out, (size_t)n, sizeof *out, dirent_cmp);
+    return n;
+}
+
+static void menu_files(const char *typed)
+{
+    const int quoted = typed[0] == '"';
+    if (quoted) typed++;
+    if (quoted ? strchr(typed, '"') != NULL : strchr(typed, ' ') != NULL) return;   /* the question */
+    const char *slash = NULL;
+    for (const char *p = typed; *p; p++) if (*p == '/' || *p == '\\') slash = p;
+    char dir[1024] = "";
+    const char *pre = typed;
+    if (slash) {
+        const size_t dl = (size_t)(slash - typed) + 1;
+        if (dl >= sizeof dir) return;
+        memcpy(dir, typed, dl);
+        dir[dl] = 0;
+        pre = slash + 1;
+    }
+    static DirEnt ents[256];
+    const int n = list_dir(dir, pre, ents, 256);
+    const int left = g_s->m->cap - g_s->m->cached;
+    snprintf(M.title, sizeof M.title, "files in %s", *dir ? dir : "the working directory");
+    snprintf(M.right, sizeof M.right, "%d positions left", left);
+    for (int i = 0; i < n; i++) {
+        const DirEnt *e = &ents[i];
+        /* a path cut short would complete to the wrong file: leave out what does not fit */
+        char path[1500], tab[sizeof ((MenuItem *)0)->tab];
+        if (snprintf(path, sizeof path, "%s%s%s", dir, e->name, e->dir ? "/" : "") >= (int)sizeof path) continue;
+        const int q = quoted || strchr(path, ' ') != NULL;
+        const int tl = e->dir ? snprintf(tab, sizeof tab, "/file %s%s", q ? "\"" : "", path)
+                              : snprintf(tab, sizeof tab, q ? "/file \"%s\" " : "/file %s ", path);
+        if (tl >= (int)sizeof tab) continue;
+        MenuItem *it = menu_add();
+        if (!it) break;
+        memcpy(it->tab, tab, (size_t)tl + 1);
+        /* the label is only shown: a long name is cut, on a UTF-8 boundary, and ends in "..." */
+        if (snprintf(it->label, sizeof it->label, "%s%s", e->name, e->dir ? "/" : "") >= (int)sizeof it->label) {
+            size_t cut = sizeof it->label - 4;
+            while (cut > 0 && ((unsigned char)it->label[cut] & 0xC0) == 0x80) cut--;
+            memcpy(it->label + cut, "...", 4);
+        }
+        if (e->dir) {
+            snprintf(it->hint, sizeof it->hint, "folder");
+        } else {
+            /* ~3.5 bytes per token for prose and code; the real count comes when it is sent */
+            const long long tok = (long long)((double)e->size / 3.5 + 0.5);
+            if (tok > left) snprintf(it->hint, sizeof it->hint, "≈ %lld tokens · more than the %d positions left", tok, left);
+            else            snprintf(it->hint, sizeof it->hint, "≈ %lld tokens · fits", tok);
+            if (e->size < 1024)          snprintf(it->value, sizeof it->value, "%lld B", e->size);
+            else if (e->size < 1 << 20)  snprintf(it->value, sizeof it->value, "%.1f KB", (double)e->size / 1024.0);
+            else                         snprintf(it->value, sizeof it->value, "%.1f MB", (double)e->size / 1048576.0);
+        }
+        it->submits = 0;
+    }
+}
+
+/* Rebuild the items for the editor's text; no menu unless it is one line starting with "/". */
+static void menu_build(void)
+{
+    const char *t = E.b.p ? E.b.p : "";
+    if (M.key && !strcmp(M.key, t) && now_s() - M.built < 1.0) return;
+    free(M.key);
+    M.key = (char *)malloc(E.b.n + 1);
+    if (M.key) memcpy(M.key, t, E.b.n + 1);
+    M.built = now_s();
+    M.n = 0;
+    M.raw_enter = 0;
+    M.title[0] = M.right[0] = 0;
+    if (t[0] != '/' || strchr(t, '\n')) return;
+    if (g_s->last_spt > 0.0)
+        snprintf(M.right, sizeof M.right, "last answer %.2f s/token · %.2f tokens/s", g_s->last_spt, 1.0 / g_s->last_spt);
+    else
+        snprintf(M.right, sizeof M.right, "local · %s", g_s->on_gpu ? "gpu" : "cpu");
+    const char *sp = strchr(t, ' ');
+    if (!sp)                              menu_commands(t);
+    else if (!strncmp(t, "/reasoning ", 11)) menu_reasoning(t + 11);
+    else if (!strncmp(t, "/gen ", 5))       menu_gen(t + 5);
+    else if (!strncmp(t, "/file ", 6))      menu_files(t + 6);
+    if (M.sel >= M.n) M.sel = M.n ? M.n - 1 : 0;
+}
+
+static int menu_open(void) { menu_build(); return M.n > 0 && !M.closed; }
+
+/* Exactly cols columns of s: cut with an ellipsis, or padded with spaces. */
+static void put_cols(Buf *b, const char *s, int cols)
+{
+    if (cols <= 0) return;
+    const int have = cols_of(s, (int)strlen(s));
+    if (have <= cols) { buf_str(b, s); spaces(b, cols - have); return; }
+    int i = 0, c = 0;
+    while (s[i] && c < cols - 1) { i++; while (s[i] && is_cont(s[i])) i++; c++; }
+    buf_add(b, s, (size_t)i);
+    buf_str(b, "…");
+}
+
+static void rule(Buf *b, int n) { for (int i = 0; i < n; i++) buf_str(b, "─"); }
+
+/* The menu's rows (0 when closed), drawn from screen row `top`. */
+static int menu_rows(void) { return M.n && !M.closed ? (M.n < MENU_ROWS ? M.n : MENU_ROWS) + 2 : 0; }
+
+static void menu_draw(Buf *f, int top, int W)
+{
+    const int rows = menu_rows() - 2, inner = W - 6;     /* between "  │" and "│" */
+    int first = M.sel - rows + 1;
+    if (first < 0) first = 0;
+    int lw = 0, vw = 0;
+    for (int i = 0; i < M.n; i++) {
+        const int l = cols_of(M.it[i].label, (int)strlen(M.it[i].label));
+        const int v = cols_of(M.it[i].value, (int)strlen(M.it[i].value));
+        if (l > lw) lw = l;
+        if (v > vw) vw = v;
+    }
+    if (lw > inner / 2) lw = inner / 2;
+    int hw = inner - 3 - lw - 2 - vw - (vw ? 2 : 1);
+    if (hw < 0) hw = 0;
+
+    char left[200];
+    snprintf(left, sizeof left, " %s ", M.title);
+    int lc = cols_of(left, (int)strlen(left)), rc = cols_of(M.right, (int)strlen(M.right)) + 2;
+    if (lc + rc + 2 > inner) rc = 0;
+    if (lc + 2 > inner) lc = inner - 2;
+    buf_fmt(f, "\033[%d;1H\033[2K  %s╭─%s", top, C_DIM, C_BRIGHT);
+    put_cols(f, left, lc);
+    buf_str(f, C_DIM);
+    rule(f, inner - 2 - lc - rc);
+    if (rc) buf_fmt(f, " %s%s%s ", C_GREEN, M.right, C_DIM);
+    buf_str(f, "─╮" C_RESET);
+
+    for (int r = 0; r < rows; r++) {
+        const int i = first + r;
+        const MenuItem *it = &M.it[i];
+        const int on = i == M.sel;
+        buf_fmt(f, "\033[%d;1H\033[2K  %s│%s", top + 1 + r, C_DIM, on ? C_PANEL : "");
+        buf_str(f, on ? C_BRIGHT " ▸ " : "   ");
+        buf_str(f, on ? C_BOLD C_BRIGHT : C_GREEN);
+        put_cols(f, it->label, lw);
+        buf_str(f, C_NOBOLD "  ");
+        buf_str(f, on ? C_TEXT : C_DIM);
+        put_cols(f, it->hint, hw);
+        buf_str(f, " ");
+        if (vw) {
+            const int v = cols_of(it->value, (int)strlen(it->value));
+            spaces(f, vw - v);
+            buf_str(f, on ? C_BRIGHT : C_DIM);
+            buf_str(f, it->value);
+            buf_str(f, " ");
+        }
+        buf_str(f, C_RESET C_DIM "│" C_RESET);
+    }
+
+    char keys[160], count[32];
+    snprintf(keys, sizeof keys, " ↑↓ choose · tab complete · enter %s · esc close ",
+             M.raw_enter ? "send as typed" : M.it[M.sel].submits ? "run" : "complete");
+    snprintf(count, sizeof count, " %d/%d ", M.sel + 1, M.n);
+    int kc = cols_of(keys, (int)strlen(keys));
+    const int cc = cols_of(count, (int)strlen(count));
+    if (kc + cc + 2 > inner) kc = 0;
+    buf_fmt(f, "\033[%d;1H\033[2K  %s╰─", top + 1 + rows, C_DIM);
+    if (kc) buf_str(f, keys);
+    rule(f, inner - 2 - kc - cc);
+    buf_str(f, count);
+    buf_str(f, "─╯" C_RESET);
+}
+
+/* ------------------------------------------------------------------ session ---- */
 static volatile int g_busy, g_worker_done, g_fatal;
 static pthread_t g_worker;
 static Glm53fInput g_job;
@@ -885,7 +1238,10 @@ static void draw(Glm53fChat *s)
     if (first_row + shown_rows > nrows) first_row = nrows - shown_rows;
 
     const int box = shown_rows + 3, footer = 1;
-    int view = H - box - footer - 1;
+    menu_build();
+    int mr = menu_rows();
+    if (H - box - footer - 1 - mr < 3) mr = 0;          /* too short a window for it */
+    int view = H - box - footer - 1 - mr;
     if (view < 1) view = 1;
     int maxoff = L.n - view;
     if (maxoff < 0) maxoff = 0;
@@ -899,9 +1255,10 @@ static void draw(Glm53fChat *s)
         buf_fmt(&f, "\033[%d;1H\033[2K", r + 1);
         if (idx >= 0 && idx < L.n) buf_str(&f, L.v[idx].s);
     }
-    buf_fmt(&f, "\033[%d;1H\033[2K", view + 1);
+    if (mr) menu_draw(&f, view + 1, W);
+    buf_fmt(&f, "\033[%d;1H\033[2K", view + mr + 1);
 
-    int row = view + 2;
+    int row = view + mr + 2;
     const char *bar = C_PANEL C_BRIGHT "▌" C_TEXT " ";
     buf_fmt(&f, "\033[%d;1H\033[2K  %s", row++, bar);
     spaces(&f, W - 6);
@@ -914,7 +1271,7 @@ static void draw(Glm53fChat *s)
         int used = 0;
         if (E.b.n == 0 && r == 0) {
             const char *ph = g_busy ? "type the next message; it goes when this answer ends"
-                                    : "Ask anything...  /file PATH for a document, /help for commands";
+                                    : "Ask anything...  / for commands, /file for a document";
             buf_str(&f, C_DIM);
             buf_str(&f, ph);
             used = cols_of(ph, (int)strlen(ph));
@@ -953,8 +1310,8 @@ static void draw(Glm53fChat *s)
         if (!getcwd(cwd, sizeof cwd)) cwd[0] = 0;
 #endif
         glm53f_chat_gauge(s, gauge, sizeof gauge);
-        if (g_offset) snprintf(right, sizeof right, "↑ %d lines · end to follow · %s · /help", g_offset, gauge);
-        else          snprintf(right, sizeof right, "%s · /help", gauge);
+        if (g_offset) snprintf(right, sizeof right, "↑ %d lines · end to follow · %s · / commands", g_offset, gauge);
+        else          snprintf(right, sizeof right, "%s · / commands", gauge);
         const int rc = cols_of(right, (int)strlen(right));
         int room = W - 4 - rc - 2;
         int cl = (int)strlen(cwd);
@@ -1009,6 +1366,16 @@ static int on_input(const char *p, int n, int view_rows)
                     continue;
                 }
                 if (!strcmp(par, "200") && fin == '~') { g_paste = 1; continue; }
+                if ((fin == 'A' || fin == 'B') && menu_open()) {   /* up, down: through the menu */
+                    M.sel = (M.sel + (fin == 'A' ? M.n - 1 : 1)) % M.n;
+                    g_dirty = 1;
+                    continue;
+                }
+                if (fin == 'Z' && menu_open()) {                   /* shift+tab: back through it */
+                    M.sel = (M.sel + M.n - 1) % M.n;
+                    g_dirty = 1;
+                    continue;
+                }
                 switch (fin) {
                 case 'A':
                     if (g_hpos > 0) { g_hpos--; ed_set(g_hist[g_hpos]); }
@@ -1035,7 +1402,8 @@ static int on_input(const char *p, int n, int view_rows)
                 g_dirty = 1;
                 continue;
             }
-            if (g_busy) glm53f_chat_stop();              /* esc: stop the answer */
+            if (menu_open()) M.closed = 1;               /* esc: close the menu first, */
+            else if (g_busy) glm53f_chat_stop();         /* then stop the answer       */
             i++;
             g_dirty = 1;
             continue;
@@ -1054,7 +1422,14 @@ static int on_input(const char *p, int n, int view_rows)
             if (c == '\r' && next < n && p[next] == '\n') next++;
             /* an unbracketed paste: more text right behind this line break */
             if (c == '\r' && next < n && (unsigned char)p[next] >= 0x20) ed_insert("\n", 1);
-            else submit();
+            else if (menu_open() && !M.raw_enter) {
+                const MenuItem *it = &M.it[M.sel];
+                const int send = it->submits;
+                ed_set(it->tab);
+                if (send) submit();                     /* otherwise it only fills the box */
+            } else {
+                submit();
+            }
             i = next;
             g_dirty = 1;
             continue;
@@ -1072,7 +1447,13 @@ static int on_input(const char *p, int n, int view_rows)
             g_dirty = 1;
             continue;
         }
-        if (c == '\t') { ed_insert("    ", 4); i++; g_dirty = 1; continue; }
+        if (c == '\t') {
+            if (menu_open()) ed_set(M.it[M.sel].tab);   /* tab: complete the choice */
+            else ed_insert("    ", 4);
+            i++;
+            g_dirty = 1;
+            continue;
+        }
         if (c < 0x20) { i++; continue; }
         int j = i;
         while (j < n && (unsigned char)p[j] >= 0x20 && p[j] != 0x7f) j++;
@@ -1145,6 +1526,7 @@ int glm53f_tui_run(Glm53fChat *s, int forced)
     for (int i = 0; i < g_nhist; i++) free(g_hist[i]);
     for (int i = 0; i < g_nqueue; i++) free(g_queue[i]);
     free(E.b.p);
+    free(M.key);
     printf("localcode · bye\n");
     return g_fatal ? 1 : 0;
 }
