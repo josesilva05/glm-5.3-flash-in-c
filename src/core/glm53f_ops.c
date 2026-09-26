@@ -39,6 +39,7 @@ static void glm53f_fatal_bound(const char *what, long value, long limit)
 }
 
 long glm53f_expert_drops = 0;
+Glm53fExpertOffload *glm53f_expert_offload = NULL;
 int  glm53f_quiet = 0;
 const char *glm53f_i4_dir = NULL;
 
@@ -1199,6 +1200,13 @@ static void moe_chunk(float *out, const float *x, const Glm53fMoeW *w, const Glm
     double tr_wait = 0.0, tr_comp = 0.0;
     struct timespec tr_a, tr_b;   /* clock_gettime: C11's timespec_get is not in gnu99 */
 
+    /* Decode experts handed to glm53f_expert_offload: released once it has finished, and
+     * computed here after all if it failed. */
+    Glm53fExpertOffload *off = T == 1 ? glm53f_expert_offload : NULL;
+    int n_off = 0, off_e[GLM53F_MAX_TOPK];
+    Glm53fExpertQ off_q[GLM53F_MAX_TOPK];
+    float *off_dst[GLM53F_MAX_TOPK];
+
     for (int b0 = 0; b0 < nu; b0 += GLM53F_MOE_BATCH) {
         const int bn = (nu - b0) < GLM53F_MOE_BATCH ? (nu - b0) : GLM53F_MOE_BATCH;
         if (!prefetch && w->src->getmany) w->src->getmany(w->src, w->layer, uniq + b0, bn);
@@ -1229,10 +1237,16 @@ static void moe_chunk(float *out, const float *x, const Glm53fMoeW *w, const Glm
                     if (ids[(size_t)t * K + j] == e) { tok[nt] = t; slot[nt] = j; nt++; }
             if (nt == 1) {                       /* decode: one token, no gathering */
                 const float *xt = x + (size_t)tok[0] * E;
+                float *dst = contrib + ((size_t)tok[0] * K + slot[0]) * E;
+                if (off && n_off < GLM53F_MAX_TOPK && q.gate.dt == GLM53F_WI4 &&
+                    off->submit(off->ctx, &q, xt, dst)) {
+                    off_e[n_off] = e; off_q[n_off] = q; off_dst[n_off] = dst; n_off++;
+                    continue;                    /* released after off->wait() */
+                }
                 glm53f_mm(gu, xt, &q.gate);
                 glm53f_mm(gu + I, xt, &q.up);
                 glm53f_swiglu_clamp(act, gu, I, c->swiglu_limit);
-                glm53f_mm(contrib + ((size_t)tok[0] * K + slot[0]) * E, act, &q.down);
+                glm53f_mm(dst, act, &q.down);
             } else if (nt > 1) {
                 for (int i = 0; i < nt; i++)
                     memcpy(xb + (size_t)i * E, x + (size_t)tok[i] * E, (size_t)E * sizeof(float));
@@ -1253,6 +1267,18 @@ static void moe_chunk(float *out, const float *x, const Glm53fMoeW *w, const Glm
                 tr_comp += (double)(tr_a.tv_sec - tr_b.tv_sec) * 1e6 + (double)(tr_a.tv_nsec - tr_b.tv_nsec) / 1e3;
             }
             if (w->src->release) w->src->release(w->src, w->layer, e);
+        }
+    }
+    if (n_off) {
+        const int failed = off->wait(off->ctx);
+        for (int i = 0; i < n_off; i++) {
+            if (failed) {
+                glm53f_mm(gu, x, &off_q[i].gate);
+                glm53f_mm(gu + I, x, &off_q[i].up);
+                glm53f_swiglu_clamp(act, gu, I, c->swiglu_limit);
+                glm53f_mm(off_dst[i], act, &off_q[i].down);
+            }
+            if (w->src->release) w->src->release(w->src, w->layer, off_e[i]);
         }
     }
     if (trace_on && T == 1) {

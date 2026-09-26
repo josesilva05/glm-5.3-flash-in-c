@@ -91,6 +91,7 @@ struct Glm53fGpu {
     int     nwarm, warm_started;
     pthread_t warm_thread;
     volatile int warm_want, warm_stop;
+    struct GExperts *gx;                   /* routed experts on a device, or NULL */
 };
 
 int glm53f_gpu_device_count(void)
@@ -424,6 +425,190 @@ static void warm_free(Glm53fGpu *g)
     }
 }
 
+/* ------------------------------------------------- routed experts on a device ---- */
+/* GLM53F_GPU_EXPERTS=N: in decode, up to N of a MoE layer's routed experts are multiplied on
+ * one device while the CPU multiplies the others (Glm53fExpertOffload). Int4 experts only.
+ * The weights stay in the host expert cache and cross PCIe per use, which beats the CPU
+ * only from page-locked memory (26.6 GB/s measured on PCIe 4.0 x16, 0.53 ms per 14.2 MB
+ * expert, against ~0.9 ms for the CPU product and ~1.1 ms for a pageable copy). So the
+ * cache arena is page-locked up to GLM53F_GPU_EXPERTS_PIN_GB (default 24: Windows refused
+ * 30 and 38 GB here) and an expert goes to the device only if its slot lies in that part.
+ * The device kernels repeat the CPU's int4 arithmetic, so the output does not change.
+ * GLM53F_GPU_EXPERTS_DEV picks the CUDA device (default: the one holding the lm_head). */
+#define GX_BUF 8
+
+typedef struct GExperts {
+    int      id, quota, n, failed, E, I;
+    float    limit;
+    unsigned char *pinned;                 /* the page-locked part of the cache arena */
+    size_t   pinned_bytes, slot_bytes;
+    unsigned char *dslot[GX_BUF];
+    float   *dx, *dg[GX_BUF], *du[GX_BUF], *dact[GX_BUF], *dy[GX_BUF];
+    float   *hx, *hy;                      /* page-locked staging: the input, GX_BUF products */
+    float   *out[GX_BUF];
+    cudaStream_t st[2];
+    cudaEvent_t  xready;
+    Glm53fExpertOffload api;
+} GExperts;
+
+static int gx_submit(void *ctx, const Glm53fExpertQ *q, const float *x, float *out)
+{
+    GExperts *gx = (GExperts *)ctx;
+    if (gx->failed || gx->n >= gx->quota || gx->n >= GX_BUF) return 0;
+    const unsigned char *base = (const unsigned char *)q->gate.w;
+    const unsigned char *end = (const unsigned char *)(q->down.s + (size_t)q->down.rows * q->down.scols);
+    if (base < gx->pinned || end > gx->pinned + gx->pinned_bytes || (size_t)(end - base) > gx->slot_bytes ||
+        q->gate.rows != gx->I || q->gate.cols != gx->E || q->down.rows != gx->E || q->down.cols != gx->I)
+        return 0;
+    int prev = 0;
+    cudaGetDevice(&prev);
+    if (cudaSetDevice(gx->id) != cudaSuccess) return 0;
+    const int b = gx->n, E = gx->E, I = gx->I;
+    int rc = 0;
+    if (b == 0) {                          /* the layer's input, once, for both streams */
+        memcpy(gx->hx, x, (size_t)E * 4);
+        rc = cudaMemcpyAsync(gx->dx, gx->hx, (size_t)E * 4, cudaMemcpyHostToDevice, gx->st[0]) != cudaSuccess ||
+             cudaEventRecord(gx->xready, gx->st[0]) != cudaSuccess ||
+             cudaStreamWaitEvent(gx->st[1], gx->xready, 0) != cudaSuccess;
+    }
+    cudaStream_t s = gx->st[b & 1];
+#define GX_AT(p) (gx->dslot[b] + ((const unsigned char *)(p) - base))
+    if (!rc)
+        rc = cudaMemcpyAsync(gx->dslot[b], base, (size_t)(end - base), cudaMemcpyHostToDevice, s) != cudaSuccess ||
+             gk_mv_i4_on(gx->dg[b], gx->dx, GX_AT(q->gate.w), (const float *)GX_AT(q->gate.s), I, E, s) != 0 ||
+             gk_mv_i4_on(gx->du[b], gx->dx, GX_AT(q->up.w), (const float *)GX_AT(q->up.s), I, E, s) != 0;
+    if (!rc) {
+        gk_swiglu_on(gx->dact[b], gx->dg[b], gx->du[b], I, gx->limit, s);
+        rc = gk_mv_i4_on(gx->dy[b], gx->dact[b], GX_AT(q->down.w), (const float *)GX_AT(q->down.s), E, I, s) != 0 ||
+             cudaMemcpyAsync(gx->hy + (size_t)b * E, gx->dy[b], (size_t)E * 4, cudaMemcpyDeviceToHost, s) != cudaSuccess;
+    }
+#undef GX_AT
+    cudaSetDevice(prev);
+    if (rc) {                              /* the CPU takes this one; wait() reports the rest */
+        if (b == 0) gx->failed = 1;
+        return 0;
+    }
+    gx->out[b] = out;
+    gx->n++;
+    return 1;
+}
+
+static int gx_wait(void *ctx)
+{
+    GExperts *gx = (GExperts *)ctx;
+    if (gx->n == 0) return 0;
+    int prev = 0;
+    cudaGetDevice(&prev);
+    int bad = cudaSetDevice(gx->id) != cudaSuccess;
+    if (!bad) bad = (cudaStreamSynchronize(gx->st[0]) != cudaSuccess) | (cudaStreamSynchronize(gx->st[1]) != cudaSuccess);
+    if (!bad) bad = gk_check("routed experts") != 0;
+    if (!bad)
+        for (int b = 0; b < gx->n; b++) memcpy(gx->out[b], gx->hy + (size_t)b * gx->E, (size_t)gx->E * 4);
+    gx->n = 0;
+    cudaSetDevice(prev);
+    if (bad && !gx->failed) {
+        fprintf(stderr, "glm53f_gpu: routed experts on cuda:%d failed; the CPU computes them from now on\n", gx->id);
+        gx->failed = 1;
+    }
+    return bad;
+}
+
+static void gx_free(GExperts *gx)
+{
+    if (!gx) return;
+    if (glm53f_expert_offload == &gx->api) glm53f_expert_offload = NULL;
+    cudaSetDevice(gx->id);
+    if (gx->pinned) cudaHostUnregister(gx->pinned);
+    for (int b = 0; b < GX_BUF; b++) {
+        if (gx->dslot[b]) cudaFree(gx->dslot[b]);
+        if (gx->dg[b]) cudaFree(gx->dg[b]);
+        if (gx->du[b]) cudaFree(gx->du[b]);
+        if (gx->dact[b]) cudaFree(gx->dact[b]);
+        if (gx->dy[b]) cudaFree(gx->dy[b]);
+    }
+    if (gx->dx) cudaFree(gx->dx);
+    if (gx->hx) cudaFreeHost(gx->hx);
+    if (gx->hy) cudaFreeHost(gx->hy);
+    for (int i = 0; i < 2; i++) if (gx->st[i]) cudaStreamDestroy(gx->st[i]);
+    if (gx->xready) cudaEventDestroy(gx->xready);
+    free(gx);
+}
+
+static GExperts *gx_create(Glm53fGpu *g, Glm53fModel *m)
+{
+    const char *e = getenv("GLM53F_GPU_EXPERTS");
+    const int quota = e ? atoi(e) : 0;
+    if (quota <= 0) return NULL;
+    const Glm53fCfg *c = &m->cfg;
+    const Glm53fCache *cache = &m->cache;
+    if (!cache->i4 || !cache->arena) {
+        fprintf(stderr, "glm53f_gpu: GLM53F_GPU_EXPERTS needs int4 experts (--experts int4 or --int4-dir); ignored\n");
+        return NULL;
+    }
+    GExperts *gx = (GExperts *)calloc(1, sizeof *gx);
+    if (!gx) return NULL;
+    const char *dv = getenv("GLM53F_GPU_EXPERTS_DEV");
+    gx->id = dv ? atoi(dv) : g->dev[g->head].id;
+    gx->quota = quota;
+    gx->E = c->hidden;
+    gx->I = c->moe_inter;
+    gx->limit = c->swiglu_limit;
+    gx->slot_bytes = (size_t)cache->slot_bytes;
+
+    /* page-lock as much of the arena as the system allows, up to the cap, in whole slots */
+    const char *pg = getenv("GLM53F_GPU_EXPERTS_PIN_GB");
+    const double cap_gb = pg ? atof(pg) : 24.0;
+    const size_t arena = (size_t)cache->nslot * gx->slot_bytes;
+    size_t want = (size_t)(cap_gb * 1e9);
+    if (want > arena) want = arena;
+    for (;;) {
+        want = want / gx->slot_bytes * gx->slot_bytes;
+        if (want < gx->slot_bytes) break;
+        if (cudaHostRegister(cache->arena, want, cudaHostRegisterPortable) == cudaSuccess) {
+            gx->pinned = cache->arena;
+            gx->pinned_bytes = want;
+            break;
+        }
+        cudaGetLastError();
+        if (want <= (size_t)2e9) break;
+        want -= (size_t)2e9;
+    }
+    if (!gx->pinned) {
+        fprintf(stderr, "glm53f_gpu: could not page-lock any of the expert cache; routed experts stay on the CPU\n");
+        free(gx);
+        return NULL;
+    }
+
+    int fail = cudaSetDevice(gx->id) != cudaSuccess;
+    const size_t E = (size_t)gx->E, I = (size_t)gx->I;
+    for (int b = 0; b < GX_BUF && !fail; b++) {
+        gx->dslot[b] = (unsigned char *)dmalloc(gx->slot_bytes, &fail);
+        gx->dg[b] = (float *)dmalloc(I * 4, &fail);
+        gx->du[b] = (float *)dmalloc(I * 4, &fail);
+        gx->dact[b] = (float *)dmalloc(I * 4, &fail);
+        gx->dy[b] = (float *)dmalloc(E * 4, &fail);
+    }
+    if (!fail) gx->dx = (float *)dmalloc(E * 4, &fail);
+    if (!fail && cudaMallocHost((void **)&gx->hx, E * 4) != cudaSuccess) fail = 1;
+    if (!fail && cudaMallocHost((void **)&gx->hy, GX_BUF * E * 4) != cudaSuccess) fail = 1;
+    for (int i = 0; i < 2 && !fail; i++)
+        if (cudaStreamCreateWithFlags(&gx->st[i], cudaStreamNonBlocking) != cudaSuccess) fail = 1;
+    if (!fail && cudaEventCreateWithFlags(&gx->xready, cudaEventDisableTiming) != cudaSuccess) fail = 1;
+    if (fail) {
+        fprintf(stderr, "glm53f_gpu: routed experts on cuda:%d unavailable (device buffers); they stay on the CPU\n", gx->id);
+        gx_free(gx);
+        return NULL;
+    }
+    gx->api.ctx = gx;
+    gx->api.submit = gx_submit;
+    gx->api.wait = gx_wait;
+    glm53f_expert_offload = &gx->api;
+    if (!glm53f_quiet)
+    printf("gpu: routed experts: up to %d per layer on cuda:%d, %.1f of %.1f GB of the expert cache page-locked\n",
+           gx->quota, gx->id, (double)gx->pinned_bytes / 1e9, (double)arena / 1e9);
+    return gx;
+}
+
 /* ------------------------------------------------------------- lifecycle ---- */
 /* Replace a BF16 or FP8 matrix by its fp32 values, computed on the device by the same kernels
  * mv() uses on the fly, so the product is unchanged; only the per-token widening goes away.
@@ -536,6 +721,8 @@ static void free_layer(GLayer *g)
 void glm53f_gpu_free(Glm53fGpu *g)
 {
     if (!g) return;
+    gx_free(g->gx);
+    g->gx = NULL;
     warm_free(g);
     if (prof_on > 0 && prof_tokens > 0)
         fprintf(stderr, "gpu profile: %ld decode steps | trunk on GPU %.2f s | routed experts on CPU %.2f s | "
@@ -702,6 +889,7 @@ Glm53fGpu *glm53f_gpu_create(Glm53fModel *m, const int *devices, int ndev)
     if (!glm53f_quiet)
     printf("\n");
     if (widened && !glm53f_quiet) printf("gpu: %.2f GB of weights kept as fp32 copies in spare device memory\n", (double)widened / 1e9);
+    g->gx = gx_create(g, m);
     return g;
 }
 

@@ -32,6 +32,15 @@ void gk_rmsnorm(float *y, const float *x, const float *w, int rows, int n, float
 /* glm53f_swiglu_clamp with gate and up in separate arrays of rows x n. */
 void gk_swiglu(float *y, const float *gate, const float *up, int rows, int n, float limit);
 
+/* The same for one row of n, launched on `stream` (a cudaStream_t). */
+void gk_swiglu_on(float *y, const float *gate, const float *up, int n, float limit, void *stream);
+
+/* y[R] = W[R][C] . x[C] for a GLM53F_WI4 matrix (nibbles W, group steps S, groups of 64),
+ * on `stream` (a cudaStream_t); bit-identical to the CPU's matmul_i4. -1 if C is not a
+ * multiple of 64 or has more than 64 groups. */
+int  gk_mv_i4_on(float *y, const float *x, const unsigned char *W, const float *S, int R, int C,
+                 void *stream);
+
 void gk_add(float *y, const float *x, int64_t n);
 
 /* glm53f_shortconv, in place allowed, state [channels][k-1] carried. */
