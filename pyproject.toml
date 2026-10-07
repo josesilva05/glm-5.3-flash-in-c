@@ -8,7 +8,7 @@ dependencies = [
     "numpy",
     "safetensors",
     "torch==2.14.0",
-    "transformers==5.17.0",
+    "transformers==5.18.0",
 ]
 
 [dependency-groups]
